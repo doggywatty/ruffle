@@ -8,7 +8,6 @@ use fnv::FnvBuildHasher;
 use gc_arena::Collect;
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::mem::swap;
 
 /// Type which represents named properties on an object.
 ///
@@ -24,10 +23,19 @@ use std::mem::swap;
 /// The internal structure of the `PropertyMap` technically allows storage of
 /// multiple values per `QName`. It's implementation enforces the invariant
 /// that each `QName` only have one associated `V`.
-#[derive(Clone, Debug, Collect)]
+
+/*
+    One entry inline per local name instead of two.
+    Nearly every local name has a single namespace,
+    and the second inline slot made each entry 96 bytes instead of 56 (measured):
+    
+    ~40 % of every class's vtable map, of which Super Smash Flash 2 keeps thousands.
+    A name with more namespaces moves its list to the heap, as it did past two.
+*/
+#[derive(Clone, Debug, Collect, PartialEq)]
 #[collect(no_drop)]
 pub struct PropertyMap<'gc, V>(
-    HashMap<AvmString<'gc>, SmallVec<[(Namespace<'gc>, V); 2]>, FnvBuildHasher>,
+    HashMap<AvmString<'gc>, SmallVec<[(Namespace<'gc>, V); 1]>, FnvBuildHasher>,
 );
 
 impl<V> Default for PropertyMap<'_, V> {
@@ -107,35 +115,53 @@ impl<'gc, V> PropertyMap<'gc, V> {
             .flat_map(|(k, vs)| vs.iter().map(|(ns, v)| (*k, *ns, v)))
     }
 
-    pub fn insert(&mut self, name: QName<'gc>, mut value: V) -> Option<V> {
+    pub fn insert(&mut self, name: QName<'gc>, value: V) -> Option<V> {
+        let bucket = self.0.entry(name.local_name()).or_default();
+
+        if let Some(position) = bucket
+            .iter()
+            .position(|(n, _)| n.matches_ns(name.namespace()))
+        {
+            let (_, old_value) = bucket.remove(position);
+            bucket.insert(0, (name.namespace(), value));
+
+            Some(old_value)
+        } else {
+            bucket.insert(0, (name.namespace(), value));
+
+            None
+        }
+    }
+
+    /// Preserves Flash Player ordering in scope caches and application domains.
+    pub fn insert_at_end(&mut self, name: QName<'gc>, value: V) -> Option<V> {
         let bucket = self.0.entry(name.local_name()).or_default();
 
         if let Some((_, old_value)) = bucket
             .iter_mut()
             .find(|(n, _)| n.matches_ns(name.namespace()))
         {
-            swap(old_value, &mut value);
-
-            Some(value)
+            Some(std::mem::replace(old_value, value))
         } else {
             bucket.push((name.namespace(), value));
-
             None
         }
     }
 
+    /*
+        Still used by our "scope.rs" (removed upstream in 5087eca85, which "insert_at_end" replaces):
+        appends, like "insert_at_end", which is the order ruffle#23253 keeps for scope caches.
+    */
     pub fn insert_with_namespace(
         &mut self,
         ns: Namespace<'gc>,
         name: AvmString<'gc>,
-        mut value: V,
+        value: V,
     ) -> Option<V> {
         let bucket = self.0.entry(name).or_default();
 
         if let Some((_, old_value)) = bucket.iter_mut().find(|(n, _)| n.matches_ns(ns)) {
-            swap(old_value, &mut value);
-
-            Some(value)
+            Some(std::mem::replace(old_value, value))
         } else {
             bucket.push((ns, value));
 

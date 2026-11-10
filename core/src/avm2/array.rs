@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 const MIN_SPARSE_LENGTH: usize = 32;
 const MAX_DENSE_LENGTH: usize = 1 << 28;
 
+// Up to this length, growing a dense array ("length = n", "new Array(n)") keeps it dense (see "set_length")
+const MAX_DENSE_GROW: usize = 1 << 16;
+
 /// The array storage portion of an array object.
 ///
 /// Array values may consist of either standard `Value`s or "holes": values
@@ -250,7 +253,20 @@ impl<'gc> ArrayStorage<'gc> {
                     }
                 }
 
-                if Self::should_convert_to_sparse(size, *occupied_count) {
+                /*
+					Growing the length keeps a dense array dense, up to "MAX_DENSE_GROW" slots.
+					avmplus (ArrayObject::setLength) only moves "m_length" and never turns an array sparse by growing it:
+					the slots past the dense part are implicit holes, and filling them in order keeps it dense.
+
+					Here the holes are slots, so "new Array(n)" with n > 32 had none used out of n and went sparse at once, for good (sparse arrays never come back):
+					every later access was a BTreeMap search and every write an insertion.
+
+					Box2DFlash creates its pools that way and new ones on every step (b2World.Solve, b2Island):
+					Fireboy & Watergirl 2 ran at 8-10 fps of 25.
+					Past the limit, as before (a slot is 16 bytes and "new Array(100000000)" must not allocate them).
+				*/
+                let growing = size > storage.len() && size <= MAX_DENSE_GROW;
+                if !growing && Self::should_convert_to_sparse(size, *occupied_count) {
                     self.convert_to_sparse();
                     if let ArrayStorage::Sparse { .. } = self {
                         self.set_length(size);

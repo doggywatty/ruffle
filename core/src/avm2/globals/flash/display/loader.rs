@@ -237,7 +237,9 @@ pub fn load_bytes<'gc>(
     let this = this.as_object().unwrap();
 
     let arg0 = args.get_object(activation, 0, "data")?;
-    let bytes = arg0.as_bytearray().unwrap().bytes().to_vec();
+
+    // the loaded movie shares the ByteArray's bytes (SharedBytes)
+    let bytes = arg0.as_bytearray_mut().unwrap().share();
     let context = args.try_get_object(1);
 
     let loader_info = this

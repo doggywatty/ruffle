@@ -16,7 +16,7 @@ use crate::backend::audio::{AudioManager, SoundInstanceHandle};
 use crate::backend::navigator::Request;
 use crate::backend::ui::MouseCursor;
 use crate::binary_data::BinaryData;
-use crate::character::{BitmapCharacter, Character, CompressedBitmap};
+use crate::character::{BitmapBytes, BitmapCharacter, Character, CompressedBitmap};
 use crate::context::{ActionType, RenderContext, UpdateContext};
 use crate::display_object::container::{ChildContainer, dispatch_removed_event};
 use crate::display_object::interactive::{
@@ -48,18 +48,89 @@ use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
 use ruffle_render::perspective_projection::PerspectiveProjection;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use swf::extensions::ReadSwfExt;
-use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
+use swf::{ClipEventFlag, FrameLabelData, TagCode, UTF_8};
 
 use super::BitmapClass;
 use super::interactive::Avm2MousePick;
 
 type FrameNumber = u16;
+
+/*
+    What timeline gotos cost.
+    "[runs, rewinds, frames stepped through, PlaceObject tags decoded, ticks in run_goto, implicit (looping) runs, ticks in the inner frame of explicit gotos]", never reset.
+*/
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_GOTO: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "flashnx_instr")]
+fn flashnx_goto_add(i: usize, n: u64) {
+    FLASHNX_GOTO[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/*
+    instr builds: clips whose movie was swapped for an empty one (unloaded, or emptied by a load),
+    by path with digits folded to "#", for the census line.
+    Combat Tournament Legends (#123) piled up thousands of empty movies during a fight: this says on which clips.
+*/
+#[cfg(feature = "flashnx_instr")]
+thread_local! {
+    static FLASHNX_EMPTIED: std::cell::RefCell<std::collections::HashMap<String, u64>> = Default::default();
+}
+
+#[cfg(feature = "flashnx_instr")]
+fn flashnx_note_emptied(clip: MovieClip<'_>, how: &str) {
+    let path: String = clip.path().to_string().chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    FLASHNX_EMPTIED.with(|t| *t.borrow_mut().entry(format!("{how} {path}")).or_default() += 1);
+}
+
+// instr builds: the clips emptied since the last call, most first.
+#[cfg(feature = "flashnx_instr")]
+pub fn flashnx_emptied_take() -> String {
+    FLASHNX_EMPTIED.with(|t| {
+        let mut t = t.borrow_mut();
+        let total: u64 = t.values().sum();
+        let mut top: Vec<(String, u64)> = t.drain().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        let shown: Vec<String> = top.iter().take(6).map(|(k, n)| format!("{k} x{n}")).collect();
+        format!("{total} [{}]", shown.join(", "))
+    })
+}
+
+/*
+    whether a goto that missed its frame gets its "goto MISSED" line.
+    One on a clip still loading always does: one on a fully loaded clip (a frame the movie never had)
+    does the first three times, then a last line says the rest go unsaid.
+*/
+fn flashnx_goto_miss_worth_saying(still_loading: bool) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static HARMLESS_SAID: AtomicU32 = AtomicU32::new(0);
+    if still_loading {
+        return true;
+    }
+    match HARMLESS_SAID.fetch_add(1, Ordering::Relaxed) {
+        0..3 => true,
+        3 => {
+            tracing::warn!("goto MISSED: further misses on fully loaded clips go unsaid");
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "flashnx_instr")]
+struct FlashnxGotoTimer(u64);
+
+#[cfg(feature = "flashnx_instr")]
+impl Drop for FlashnxGotoTimer {
+    fn drop(&mut self) {
+        flashnx_goto_add(4, crate::avm1::flashnx_ticks().wrapping_sub(self.0));
+    }
+}
 
 /// Indication of what frame `run_frame` should jump to next.
 #[derive(PartialEq, Eq)]
@@ -140,6 +211,11 @@ impl fmt::Debug for MovieClip<'_> {
 pub struct MovieClipWeak<'gc>(GcWeak<'gc, MovieClipData<'gc>>);
 
 impl<'gc> MovieClipWeak<'gc> {
+    // see "MovieLibrary::in_use" in library.rs.
+    pub fn is_dead(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        self.0.is_dead(fc)
+    }
+
     pub fn upgrade(self, mc: &Mutation<'gc>) -> Option<MovieClip<'gc>> {
         self.0.upgrade(mc).map(MovieClip)
     }
@@ -192,6 +268,19 @@ pub struct MovieClipData<'gc> {
     ///
     /// `None` in an AVM2 movie.
     next_avm1_clip: Lock<Option<MovieClip<'gc>>>,
+
+    /*
+        The last AVM1 "MovieClipReference" built for this clip, reused while the path it encodes is unchanged.
+        (see "MovieClipReference::try_from_stage_object")
+    */
+    flashnx_ref: Lock<Option<crate::avm1::MovieClipReference<'gc>>>,
+
+    /*
+        Fingerprint of the path "flashnx_ref" encodes, and the address of the data it was built for:
+        "MovieClipData" is "Clone" ("instantiate"), and a clone must never inherit a reference whose cached object is the original.
+    */
+    flashnx_ref_sig: Cell<u64>,
+    flashnx_ref_owner: Cell<usize>,
 
     audio_stream: Cell<Option<SoundInstanceHandle>>,
 
@@ -262,6 +351,9 @@ impl<'gc> MovieClipData<'gc> {
             hit_area: Lock::new(None),
             attached_audio: Lock::new(None),
             next_avm1_clip: Lock::new(None),
+            flashnx_ref: Lock::new(None),
+            flashnx_ref_sig: Cell::new(0),
+            flashnx_ref_owner: Cell::new(0),
         }
     }
 
@@ -274,6 +366,11 @@ impl<'gc> MovieClipData<'gc> {
 impl<'gc> MovieClip<'gc> {
     pub fn downgrade(self) -> MovieClipWeak<'gc> {
         MovieClipWeak(Gc::downgrade(self.0))
+    }
+
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared.get())
     }
 
     pub fn new(movie: Arc<SwfMovie>, mc: &Mutation<'gc>) -> Self {
@@ -375,6 +472,11 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        crate::display_object::mark_lifecycle_dirty(self.into());
+        #[cfg(feature = "flashnx_instr")]
+        if movie.is_none() {
+            flashnx_note_emptied(self, "emptied");
+        }
         let write = Gc::write(context.gc(), self.0);
         let movie =
             movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(write.movie().version(), None)));
@@ -409,6 +511,27 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn set_next_avm1_clip(&self, mc: &Mutation<'gc>, node: Option<MovieClip<'gc>>) {
         unlock!(Gc::write(mc, self.0), MovieClipData, next_avm1_clip).set(node);
+    }
+
+    /*
+        The cached AVM1 reference,
+        if it was built for this very clip (not the one its data was cloned from) and for the path whose fingerprint is "sig".
+    */
+    pub fn flashnx_cached_ref(self, sig: u64) -> Option<crate::avm1::MovieClipReference<'gc>> {
+        if self.0.flashnx_ref_owner.get() == Gc::as_ptr(self.0) as usize && self.0.flashnx_ref_sig.get() == sig
+        {
+            self.0.flashnx_ref.get()
+        }
+        else
+        {
+            None
+        }
+    }
+
+    pub fn flashnx_set_cached_ref(self, mc: &Mutation<'gc>,  reference: crate::avm1::MovieClipReference<'gc>, sig: u64, ) {
+        unlock!(Gc::write(mc, self.0), MovieClipData, flashnx_ref).set(Some(reference));
+        self.0.flashnx_ref_sig.set(sig);
+        self.0.flashnx_ref_owner.set(Gc::as_ptr(self.0) as usize);
     }
 
     pub fn call_on_construct_handler(self, context: &mut UpdateContext<'gc>) {
@@ -454,8 +577,13 @@ impl<'gc> MovieClip<'gc> {
             if is_load_frame {
                 self.event_dispatch(context, ClipEvent::Load);
                 self.0.set_initialized(true);
-            } else {
+            } else if !self.0.contains_flag(MovieClipFlags::UNLOADED)
+                || crate::frame_lifecycle::unloaded_clip_gets_enter_frame()
+            {
                 self.event_dispatch(context, ClipEvent::EnterFrame);
+            } else {
+                #[cfg(feature = "flashnx_instr")]
+                flashnx_note_emptied(self, "quiet");
             }
 
             // Run my SWF tags.
@@ -558,7 +686,7 @@ impl<'gc> MovieClip<'gc> {
                 TagCode::FrameLabel => shared.frame_label(reader),
                 TagCode::JpegTables => shared.jpeg_tables(context, reader),
                 TagCode::ShowFrame => shared.show_frame(reader, tag_len),
-                TagCode::ScriptLimits => shared.script_limits(reader, context.avm1),
+                TagCode::ScriptLimits => shared.script_limits(context, reader),
                 TagCode::SoundStreamHead => shared.sound_stream_head(reader, 1),
                 TagCode::SoundStreamHead2 => shared.sound_stream_head(reader, 2),
                 TagCode::VideoFrame => shared.preload_video_frame(context, reader),
@@ -836,6 +964,12 @@ impl<'gc> MovieClip<'gc> {
         self.0.last_queued_script_frame.set(frame);
     }
 
+    // Called by the SWFv9 path of "run_inner_goto_frame", which does not construct the objects the goto placed.
+    pub fn set_goto_construct_pending(self) {
+        self.0
+            .set_flag(MovieClipFlags::GOTO_CONSTRUCT_PENDING, true);
+    }
+
     pub fn set_programmatically_played(self) {
         if self.header_frames() > 1 {
             self.0.set_programmatically_played()
@@ -849,7 +983,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn play(self) {
-        self.0.play()
+        self.0.play();
+        // The next enter_frame must visit it ("ENTER_QUIET").
+        crate::display_object::mark_enter_needed(self.into());
     }
 
     pub fn prev_frame(self, context: &mut UpdateContext<'gc>) {
@@ -913,6 +1049,7 @@ impl<'gc> MovieClip<'gc> {
                 // the current frame, the goto is properly queued.
 
                 self.0.queued_goto_frame.set(Some(frame));
+                crate::display_object::mark_lifecycle_dirty(self.into());
 
                 // If we have a frame script on that frame, add ourselves to the
                 // frame script cleanup queue so that that frame script is
@@ -1144,6 +1281,7 @@ impl<'gc> MovieClip<'gc> {
     /// This sets the current frame of this MovieClip to a given number.
     pub fn set_current_frame(self, current_frame: FrameNumber) {
         self.0.current_frame.set(current_frame);
+        crate::display_object::mark_lifecycle_dirty(self.into());
     }
 
     /// The amount of frames loaded in this movieclip.
@@ -1486,6 +1624,7 @@ impl<'gc> MovieClip<'gc> {
             // in the meantime, it should absolutely run again.
             self.set_last_queued_script_frame(None);
         }
+        crate::display_object::mark_lifecycle_dirty(self.into());
     }
 
     /// Instantiate a given child object on the timeline at a given depth.
@@ -1626,6 +1765,13 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_goto(mut self, context: &mut UpdateContext<'gc>, frame: FrameNumber, is_implicit: bool) {
+        #[cfg(feature = "flashnx_instr")]
+        let _flashnx_timer = {
+            flashnx_goto_add(0, 1);
+            flashnx_goto_add(5, is_implicit as u64);
+            FlashnxGotoTimer(crate::avm1::flashnx_ticks())
+        };
+        crate::display_object::mark_lifecycle_dirty(self.into());
         if cfg!(feature = "timeline_debug") {
             tracing::debug!(
                 "[{}]: {} from frame {} to frame {}",
@@ -1665,6 +1811,8 @@ impl<'gc> MovieClip<'gc> {
             // otherwise AS3 can observe byproducts of the rewinding process.
             self.0.tag_stream_pos.set(0);
             self.0.current_frame.set(0);
+            #[cfg(feature = "flashnx_instr")]
+            flashnx_goto_add(1, 1);
 
             true
         } else {
@@ -1698,6 +1846,8 @@ impl<'gc> MovieClip<'gc> {
         let mut reader = data.read_from(frame_pos);
         while self.current_frame() < clamped_frame && !reader.get_ref().is_empty() {
             self.0.increment_current_frame();
+            #[cfg(feature = "flashnx_instr")]
+            flashnx_goto_add(2, 1);
             frame_pos = reader.get_ref().as_ptr() as u64 - tag_stream_start;
 
             let tag_callback = |reader: &mut _, tag_code, _tag_len| {
@@ -1720,6 +1870,8 @@ impl<'gc> MovieClip<'gc> {
                 match action {
                     Action::Place(version) => {
                         index += 1;
+                        #[cfg(feature = "flashnx_instr")]
+                        flashnx_goto_add(3, 1);
                         self.0.goto_place_object(
                             reader,
                             version,
@@ -1746,7 +1898,28 @@ impl<'gc> MovieClip<'gc> {
                 tracing::error!("Error running abc/symbols in goto: {e:?}");
             }
         }
+
         let hit_target_frame = self.0.current_frame() == frame;
+        /*
+            A goto that lands somewhere else than it asked for, said out loud.
+
+            "run_goto" clamps the target to "frames_loaded",
+            and when the clamp bites there is no error, no retry and no record:
+            the clip is simply left where it was, already stopped by "goto_frame".
+            A movie that asks to leave frame 1 before frame 2 has streamed in therefore parks on frame 1 for ever, in total silence.
+            Diagnosing that from the outside costs hours (see FlashNX issue #76), so it costs one line here.
+
+            "total" tells the two apart: loaded < total is a clip still being preloaded (ours to fix),
+            loaded == total is a movie asking for a frame nobody ever authored (its own bug, and harmless).
+            
+            The harmless kind is said three times only:
+            Combat Tournament Legends (#123) asks its HUD for frame 8 of 6 on every frame, 2000 lines in 90 seconds,
+            which pushed everything else out of a bug report's log.
+        */
+        if !hit_target_frame && flashnx_goto_miss_worth_saying(self.0.frames_loaded() < i32::from(self.header_frames()), )
+        {
+            tracing::warn!("goto MISSED: wanted={} clamped={} loaded={} total={} now={} who={}", frame, clamped_frame, self.0.frames_loaded(), self.header_frames(), self.current_frame(), self.path(), );
+        }
 
         if is_rewind {
             // Remove all display objects that were created after the
@@ -1877,14 +2050,19 @@ impl<'gc> MovieClip<'gc> {
             .filter(|params| params.frame >= frame)
             .for_each(|goto| run_goto_command(self, context, goto));
 
-        if !is_implicit {
+        // Not on an AVM1 clip ("explicit_goto_runs_inner_frame").
+        if !is_implicit && crate::frame_lifecycle::explicit_goto_runs_inner_frame(self) {
             // On AVM2, all explicit gotos act the same way as a normal new frame,
             // save for the lack of an enterFrame event. Since this must happen
             // before AS3 continues execution, this is effectively a "recursive
             // frame".
             //
             // Our queued place tags will now run at this time, too.
+            #[cfg(feature = "flashnx_instr")]
+            let t_inner = crate::avm1::flashnx_ticks();
             run_inner_goto_frame(context, &removed_frame_scripts, self);
+            #[cfg(feature = "flashnx_instr")]
+            flashnx_goto_add(6, crate::avm1::flashnx_ticks().wrapping_sub(t_inner));
         }
 
         self.assert_expected_tag_end(hit_target_frame);
@@ -2149,6 +2327,7 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'gc>,
     ) {
         let current_frame = self.current_frame();
+        crate::display_object::mark_lifecycle_dirty(self.into());
 
         let write = unlock!(Gc::write(context.gc(), self.0), MovieClipData, cell);
         let mut frame_scripts = RefMut::map(write.borrow_mut(), |r| &mut r.frame_scripts);
@@ -2391,6 +2570,8 @@ impl<'gc> MovieClip<'gc> {
     /// This happens if a MovieClip has been unloaded. The state is then changed one
     /// frame after the command to unload the MovieClip has been read.
     fn transform_to_unloaded_state(self, context: &mut UpdateContext<'gc>) {
+        #[cfg(feature = "flashnx_instr")]
+        flashnx_note_emptied(self, "unloaded");
         let movie = if let Some(DisplayObject::MovieClip(parent_mc)) = self.parent() {
             let parent_movie = parent_mc.movie();
             let parent_version = parent_movie.version();
@@ -2403,7 +2584,22 @@ impl<'gc> MovieClip<'gc> {
             None
         };
 
+        /*
+            ruffle#4024: "replace_with_movie" clears the flag that says the clip already ran its load event,
+            so the next frame ran "onClipEvent(load)/onLoad" again: Flash runs it once.
+            
+            A handler that unloads its own clip
+            (Combat Tournament Legends, #123: every fighter not picked does "this.unloadMovie()" in its load handler)
+            then unloaded it again every frame, and each round left a new empty movie and whatever the handler attached behind:
+            7 per frame, 60 to 5 fps within a fight.
+            Loading a real movie into the clip still runs its load event: that path does not come through here.
+        */
+        let was_initialized = self.0.initialized();
         self.replace_with_movie(context, movie, self.is_root(), None);
+        if was_initialized {
+            self.0.set_initialized(true);
+        }
+        self.0.set_flag(MovieClipFlags::UNLOADED, true);
     }
 
     pub fn attach_audio(self, context: &mut UpdateContext<'gc>, netstream: Option<NetStream<'gc>>) {
@@ -2424,6 +2620,21 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        /*
+            A SWFv9 goto does not construct the frame it lands on (see "run_inner_goto_frame"):
+            the objects it placed stay on the display list without an AVM2 object until our next `construct_frame`.
+            
+            When the goto ran after this clip's construction pass (from a constructor or an event handler),
+            the frame script of the target frame comes first.
+            
+            Flash Player constructs those objects before running it,
+            after the goto has returned (avm2/swf_9_goto_in_construct_frame, timeline/swf_9_event_goto_frame_script),
+            so the script finds its children (Raze 2, ruffle#23532: Chowder: Bookin' Cook, ruffle#15039).
+        */
+        if self.0.contains_flag(MovieClipFlags::GOTO_CONSTRUCT_PENDING) && self.frame_script_due() {
+            self.construct_frame(context);
+        }
+
         let avm2_object = self.0.object2.get();
 
         if let Some(avm2_object) = avm2_object
@@ -2494,9 +2705,38 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
+    /*
+        A frame script of the current frame that has not run for it yet.
+        
+        Either one "run_local_frame_scripts" would still run (held back while this clip is already running one),
+        or one registered during the frame-script phase:
+        that one waits in "frame_script_cleanup_queue" without being marked pending,
+        
+        and an inner goto empties that queue and relies on its walk to run it (timeline/frame_script_cleanup_goto2).
+        "has_pending_script" alone stays set after the script has run.
+    */
+    fn frame_script_outstanding(self) -> bool {
+        let current = self.0.current_frame.get();
+        if self.last_queued_script_frame() != Some(current) && self.frame_script(current).is_some()
+        {
+            return true;
+        }
+        if !self.has_pending_script() {
+            return false;
+        }
+        let frame_id = self.0.queued_script_frame.get();
+        self.last_queued_script_frame() != Some(frame_id) && self.frame_script(frame_id).is_some()
+    }
+
     fn check_has_pending_script(self) {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
         self.set_has_pending_script(has_pending_script);
+    }
+
+    // Whether "run_local_frame_scripts" is about to run a frame script.
+    fn frame_script_due(self) -> bool {
+        let frame_id = self.0.queued_script_frame.get();
+        self.0.object2.get().is_some()&& self.has_pending_script() && !self.0.contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT) && self.last_queued_script_frame() != Some(frame_id) && self.frame_script(frame_id).is_some()
     }
 }
 
@@ -2519,8 +2759,14 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        // Whether every child's subtree is quiet after this walk.
+        let mut children_quiet = true;
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
+            // A quiet subtree has nothing to do ("ENTER_QUIET").
+            if !skip_frame && crate::display_object::skip_quiet_child(child) {
+                continue;
+            }
             if skip_frame {
                 // If we're skipping our current frame, then we want to skip it for our children
                 // as well. This counts as the skipped frame for any children that already
@@ -2535,10 +2781,12 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 child.base().set_skip_next_enter_frame(true);
             }
             child.enter_frame(context);
+            children_quiet &= crate::display_object::quiet_after_enter(child);
         }
 
         if skip_frame {
             self.base().set_skip_next_enter_frame(false);
+            self.base().set_enter_quiet(false);
             return;
         }
 
@@ -2554,6 +2802,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             // after tags have executed.
             let data = self.0.shared.get().swf.clone();
             let place_actions = self.unqueue_filtered(|q| q.unqueue_add());
+            let placed = !place_actions.is_empty();
 
             for (_, tag) in place_actions {
                 let mut reader = data.read_from(tag.tag_start);
@@ -2566,11 +2815,23 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     tracing::error!("Error running queued tag: {:?}, got {}", tag.tag_type, e);
                 }
             }
+
+            /*
+                quiet once the next enter_frame would do nothing here:
+                stopped, no tag left queued, none placed now,
+                nothing marked since the last frame-script pass, all children quiet.
+            */
+            let quiet = children_quiet && !placed && !self.playing() && self.0.queued_tags.borrow().is_empty() && !self.base().lifecycle_dirty();
+            self.base().set_enter_quiet(quiet);
+        } else {
+            self.base().set_enter_quiet(false);
         }
     }
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        self.0.set_flag(MovieClipFlags::GOTO_CONSTRUCT_PENDING, false);
+
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2601,6 +2862,10 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     .0
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 for child in self.iter_render_list() {
+                    // An inner goto passes over unchanged subtrees.
+                    if crate::display_object::skip_clean_child(child) {
+                        continue;
+                    }
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
                     if child.object2().is_none() {
@@ -2635,11 +2900,20 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        // lifecycle flags (see "settle_lifecycle_dirty")
+        self.base().set_lifecycle_dirty(false);
         self.run_local_frame_scripts(context);
 
+        let mut child_dirty = false;
         for child in self.iter_render_list() {
+            if crate::display_object::skip_clean_child(child) {
+                continue;
+            }
             child.run_frame_scripts(context);
+            child_dirty |= child.base().lifecycle_dirty();
         }
+        let unfinished = self.object2().is_none() || self.frame_script_outstanding();
+        crate::display_object::settle_lifecycle_dirty(self.into(), unfinished, child_dirty);
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -3017,6 +3291,25 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                             return result;
                         } else {
                             result = None;
+                        }
+                    }
+
+                    /*
+                        A clip layer's own buttons take clicks, as in Flash Player.
+                        
+                        Stick War's START button sits in the screen that masks the mission art,
+                        and nothing could start a battle (ruffle#5126, open since 2021)
+                        
+                        Only when nothing above was hit:
+                        a masked object still wins inside its mask and is still refused outside it,
+                        which is what the 2021 attempt
+                        (ruffle#5247, reverted in #5471 over Steppenwolf, #5470) lost by picking into the mask first.
+                    */
+                    if result.is_none() && crate::display_object::flashnx_mask_fixes() && let Some(mask) = child.as_interactive() && !mask.as_displayobject().movie().is_action_script_3()
+                    {
+                        result = mask.mouse_pick_avm1(context, point, require_button_mode);
+                        if result.is_some() {
+                            hit_depth = child.depth();
                         }
                     }
                 } else if result.is_none() {
@@ -3437,14 +3730,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let define_bits_lossless = reader.read_define_bits_lossless(version)?;
         let bitmap = Gc::new(
             context.gc(),
-            BitmapCharacter::new(CompressedBitmap::Lossless(DefineBitsLossless {
+            // The pixel data stays in the movie (see "BitmapBytes").
+            BitmapCharacter::new(CompressedBitmap::Lossless {
                 id: define_bits_lossless.id,
                 format: define_bits_lossless.format,
                 width: define_bits_lossless.width,
                 height: define_bits_lossless.height,
                 version: define_bits_lossless.version,
-                data: Cow::Owned(define_bits_lossless.data.into_owned()),
-            })),
+                data: BitmapBytes::from_movie(&self.swf, &define_bits_lossless.data),
+            }),
         );
         self.library_mut(context)
             .register_character(define_bits_lossless.id, Character::Bitmap(bitmap));
@@ -3562,13 +3856,16 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let library = self.library_mut(context);
         let (id, jpeg_data) = reader.read_define_bits()?;
         let jpeg_tables = library.jpeg_tables();
-        let jpeg_data =
-            ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, jpeg_tables).into_owned();
-        let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(&jpeg_data)?;
+        // Glue only to read the dimensions: the bitmap keeps the tag bytes in the movie plus the shared tables, and glues them at decode.
+        let glued = ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, jpeg_tables);
+        let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(&glued)?;
+        drop(glued);
+        let tables = library.jpeg_tables_shared();
         let bitmap = Character::Bitmap(Gc::new(
             mc,
             BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg_data,
+                data: BitmapBytes::from_movie(&self.swf, jpeg_data),
+                tables,
                 alpha: None,
                 width,
                 height,
@@ -3589,7 +3886,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let bitmap = Character::Bitmap(Gc::new(
             context.gc(),
             BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg_data.to_owned(),
+                data: BitmapBytes::from_movie(&self.swf, jpeg_data),
+                tables: None,
                 alpha: None,
                 width,
                 height,
@@ -3612,8 +3910,9 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let bitmap = Character::Bitmap(Gc::new(
             context.gc(),
             BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg.data.to_owned(),
-                alpha: Some(jpeg.alpha_data.to_owned()),
+                data: BitmapBytes::from_movie(&self.swf, jpeg.data),
+                tables: None,
+                alpha: Some(BitmapBytes::from_movie(&self.swf, jpeg.alpha_data)),
                 width,
                 height,
             }),
@@ -3842,7 +4141,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
     ) -> Result<(), Error> {
         let sound = reader.read_define_sound()?;
-        if let Ok(handle) = context.audio.register_sound(&sound) {
+        // The mixer references the sound in the movie ("SoundBytes").
+        if let Ok(handle) = context.audio.register_sound_from_movie(&sound, &self.swf) {
             self.library_mut(context)
                 .register_character(sound.id, Character::Sound(handle));
         } else {
@@ -3968,11 +4268,32 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     }
 
     #[inline]
-    fn script_limits(&self, reader: &mut SwfStream<'a>, avm: &mut Avm1<'gc>) -> Result<(), Error> {
+    fn script_limits(&self, context: &mut UpdateContext<'gc>, reader: &mut SwfStream<'a>, ) -> Result<(), Error> {
         let max_recursion_depth = reader.read_u16()?;
-        let _timeout_in_seconds = reader.read_u16()?;
+        let timeout_in_seconds = reader.read_u16()?;
 
-        avm.set_max_recursion_depth(max_recursion_depth);
+        context.avm1.set_max_recursion_depth(max_recursion_depth);
+
+        /*
+            honour the script timeout the movie asks for, as Flash does.
+            
+            Upstream reads it and drops it, so every movie gets the 15 s default.
+            Super Smash Flash 2 asks for 60 s,
+            and the frame that loads a fight runs about 15.6 s on the Switch:
+            killed a fraction of a second short,
+            which is the black screen on entering every fight (ruffle#24726 is the same wall on desktop).
+            
+            Only ever raised, so a movie asking for less than the default is not cut sooner than it is today,
+            and capped at 60 s:
+            the timeout is the only bound on how long a stuck script can freeze the console.
+            
+            The largest value seen wins, so a SWF loaded later with the IDE default cannot lower it again.
+        */
+        let requested = std::time::Duration::from_secs(u64::from(timeout_in_seconds.min(60)));
+        if requested > *context.max_execution_duration {
+            tracing::info!("ScriptLimits: script timeout raised to {} s (movie asked for {} s)", requested.as_secs(), timeout_in_seconds );
+            *context.max_execution_duration = requested;
+        }
 
         Ok(())
     }
@@ -4937,7 +5258,7 @@ pub enum QueuedTagAction {
 bitflags! {
     /// Boolean state flags used by `MovieClip`.
     #[derive(Clone, Copy)]
-    struct MovieClipFlags: u8 {
+    struct MovieClipFlags: u16 {
         /// Whether this `MovieClip` has run its initial frame.
         const INITIALIZED             = 1 << 0;
 
@@ -4968,6 +5289,19 @@ bitflags! {
 
         /// Whether the AVM2 constructor of this `MovieClip` threw an error.
         const AVM2_CONSTRUCTOR_FAILED = 1 << 7;
+
+        /*
+            emptied by "unloadMovie()" ("transform_to_unloaded_state") and not loaded into since:
+            "replace_with_movie" clears it, so a movie loaded into the clip afterwards brings its events back.
+            While set, the clip gets no enterFrame event (ruffle#19434).
+        */
+        const UNLOADED = 1 << 8;
+
+        /*
+            A SWFv9 goto placed objects on this clip without constructing them,
+            and no "construct_frame" has run on it since. (see "run_local_frame_scripts")
+        */
+        const GOTO_CONSTRUCT_PENDING = 1 << 9;
     }
 }
 

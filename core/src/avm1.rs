@@ -10,6 +10,12 @@ mod function;
 mod property_decl;
 
 mod activation;
+#[cfg(feature = "flashnx_instr")]
+pub(crate) use activation::{
+	FLASHNX_AVM1_ACTIONS, FLASHNX_AVM1_DECODE_TICKS, FLASHNX_AVM1_TOTAL_TICKS, FLASHNX_CALL_NAMES,
+	FLASHNX_GET_NAMES, FLASHNX_OP_COUNT, FLASHNX_OP_TICKS, flashnx_set_avm1_named, flashnx_ticks,
+};
+
 mod callable_value;
 mod clamp;
 mod debug;
@@ -18,7 +24,13 @@ mod flv;
 mod fscommand;
 pub(crate) mod globals;
 mod object;
+
 mod object_reference;
+pub(crate) use object_reference::{ MovieClipReference, flashnx_mcref_cache_on, flashnx_set_mcref_cache, };
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) use object_reference::{FLASHNX_MCREF_CALLS, FLASHNX_MCREF_HITS, FLASHNX_MCREF_TICKS};
+
 mod parameters;
 mod property;
 mod property_map;
@@ -27,7 +39,7 @@ mod scope;
 mod value;
 mod xml;
 
-pub use activation::{Activation, ActivationIdentifier};
+pub use activation::{Activation, ActivationIdentifier, set_avm1_fast_push};
 pub use debug::VariableDumper;
 pub use error::Error;
 pub use flv::FlvValueAvm1Ext;

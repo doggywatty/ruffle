@@ -49,6 +49,9 @@ pub fn initialize_for_allocator<'gc>(
     // frame behind objects placed by the timeline (even if they were
     // both placed in the same frame to begin with).
     dobj.base().set_skip_next_enter_frame(true);
+
+    // the next enter_frame must visit it to consume the flag.
+    crate::display_object::mark_enter_needed(dobj);
     dobj.on_construction_complete(context);
 
     obj
@@ -863,7 +866,7 @@ pub fn set_blend_mode<'gc>(
     Ok(Value::Undefined)
 }
 
-fn new_rectangle<'gc>(
+pub(crate) fn new_rectangle<'gc>(
     activation: &mut Activation<'_, 'gc>,
     rectangle: Rectangle<Twips>,
 ) -> Result<Value<'gc>, Error<'gc>> {

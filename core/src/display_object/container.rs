@@ -24,6 +24,15 @@ use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_GETNAME_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_GETNAME_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_GETNAME_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren, recursively.
 pub fn dispatch_removed_from_stage_event<'gc>(
@@ -887,6 +896,37 @@ impl<'gc> ChildContainer<'gc> {
     /// If multiple children with the same name exist, the one that occurs
     /// first in the render list wins.
     fn get_name(&self, name: &WStr, case_sensitive: bool) -> Option<DisplayObject<'gc>> {
+        /*
+            2026-09-23: how often AVM1 resolves a child by name and how many children the linear scan below compares each time (upstream's own TODO).
+            Only with the "flashnx_instr" feature.
+        */
+        #[cfg(feature = "flashnx_instr")]
+        let t0 = crate::avm1::flashnx_ticks();
+        let found = self.get_name_scan(name, case_sensitive);
+        #[cfg(feature = "flashnx_instr")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let t1 = crate::avm1::flashnx_ticks();
+            /*
+                Compared: every child on a miss or with pending removals, else up to and including the match.
+                Counted after "t1", off the clock.
+            */
+            let scanned = if self.has_pending_removals {
+                self.depth_list.len()
+            } else {
+                match found {
+                    Some(f) => self.render_list.iter().position(|c| DisplayObject::ptr_eq(*c, f)).map_or(self.render_list.len(), |p| p + 1),
+                    None => self.render_list.len(),
+                }
+            };
+            FLASHNX_GETNAME_CALLS.fetch_add(1, Relaxed);
+            FLASHNX_GETNAME_SCANNED.fetch_add(scanned as u64, Relaxed);
+            FLASHNX_GETNAME_TICKS.fetch_add(t1.wrapping_sub(t0), Relaxed);
+        }
+        found
+    }
+
+    fn get_name_scan(&self, name: &WStr, case_sensitive: bool) -> Option<DisplayObject<'gc>> {
         if self.has_pending_removals {
             // Find matching children by searching the depth list
             let mut matching_render_children = if case_sensitive {

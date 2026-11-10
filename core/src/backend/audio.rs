@@ -80,6 +80,30 @@ impl From<swf::SoundStreamHead> for SoundStreamInfo {
     }
 }
 
+static SOUND_BYTES_SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SOUND_BYTES_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Counts the bytes of an embedded sound the mixer referenced in its movie (shared) or copied.
+#[cfg_attr(not(feature = "audio"), expect(dead_code))]
+pub(crate) fn note_sound_bytes(shared: bool, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counter = if shared {
+        &SOUND_BYTES_SHARED
+    } else {
+        &SOUND_BYTES_COPIED
+    };
+    counter.fetch_add(len as u64, Relaxed);
+}
+
+// Bytes of embedded sounds that referenced their movie/that were copied, since boot (census: line).
+pub fn sound_bytes_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SOUND_BYTES_SHARED.load(Relaxed),
+        SOUND_BYTES_COPIED.load(Relaxed),
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum RegisterError {
     #[error("MP3 sound is too short")]
@@ -92,6 +116,17 @@ pub trait AudioBackend: Any {
 
     /// Registers an sound embedded in an SWF.
     fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError>;
+
+    /*
+        registers a sound embedded in "movie".
+        A backend that keeps the sound's bytes may reference them in the movie instead of copying them (the mixer does): the others just register it.
+    */
+    fn register_sound_from_movie(&mut self, swf_sound: &swf::Sound, _movie: &crate::tag_utils::SwfSlice, ) -> Result<SoundHandle, RegisterError> {
+        self.register_sound(swf_sound)
+    }
+
+    // forgets a sound of a library that was dropped (see "Library::finalize_released"). Instances still playing finish.
+    fn unregister_sound(&mut self, _sound: SoundHandle) {}
 
     /// Registers MP3 audio from an external source.
     fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError>;

@@ -9,6 +9,32 @@ use ruffle_common::duration::FloatDuration;
 use slotmap::SlotMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, RwLock};
+
+/*
+    Event-sound starts since the last "take_sound_start_stats", as (sound id, starts, largest loop count asked for).
+    Tells a sound restarted every frame from a single one looping forever (a "beep" repeating after a hit on Mr. Game & Watch in Super Smash Flash 2).
+*/
+static SOUND_STARTS: Mutex<Vec<(u64, u32, u16)>> = Mutex::new(Vec::new());
+
+fn count_sound_start(handle: SoundHandle, num_loops: u16) {
+    use slotmap::Key;
+    let id = handle.data().as_ffi();
+    if let Ok(mut starts) = SOUND_STARTS.lock() {
+        if let Some(entry) = starts.iter_mut().find(|e| e.0 == id) {
+            entry.1 += 1;
+            entry.2 = entry.2.max(num_loops);
+        } else if starts.len() < 256 {
+            starts.push((id, 1, num_loops));
+        }
+    }
+}
+
+// see "SOUND_STARTS". Most-started first.
+pub fn take_sound_start_stats() -> Vec<(u64, u32, u16)> {
+    let mut starts = SOUND_STARTS.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+    starts.sort_by(|a, b| b.1.cmp(&a.1));
+    starts
+}
 use swf::AudioCompression;
 
 /// Holds the last 2048 output audio frames. Frames can be written to it one by
@@ -150,7 +176,7 @@ struct Sound {
     /// The audio data of this sound.
     ///
     /// This will be compressed in the format indicated by `format.compression`.
-    data: Arc<[u8]>,
+    data: SoundBytes,
 
     /// Number of samples in this audio.
     /// This does not include `skip_sample_frames`.
@@ -298,7 +324,7 @@ impl AudioMixer {
     ///  * ActionScript sounds that may have a custom start and loop setting
     fn make_seekable_decoder(
         format: &swf::SoundFormat,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<SoundBytes>,
     ) -> Result<Box<dyn SeekableDecoder>, decoders::Error> {
         let decoder: Box<dyn SeekableDecoder> = match format.compression {
             AudioCompression::UncompressedUnknownEndian => {
@@ -359,7 +385,7 @@ impl AudioMixer {
         &self,
         sound: &Sound,
         settings: &swf::SoundInfo,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<SoundBytes>,
     ) -> Result<Box<dyn Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let decoder = Self::make_seekable_decoder(&sound.format, data)?;
@@ -511,6 +537,23 @@ impl AudioMixer {
 
     /// Registers an embedded SWF sound with the audio mixer.
     pub fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
+        self.register_swf_sound(swf_sound, None)
+    }
+
+    // registers a sound embedded in "movie", referencing its bytes there rather than copying them (see "SoundBytes").
+    pub fn register_sound_from_movie(
+        &mut self,
+        swf_sound: &swf::Sound,
+        movie: &SwfSlice,
+    ) -> Result<SoundHandle, RegisterError> {
+        self.register_swf_sound(swf_sound, Some(movie))
+    }
+
+    fn register_swf_sound(
+        &mut self,
+        swf_sound: &swf::Sound,
+        movie: Option<&SwfSlice>,
+    ) -> Result<SoundHandle, RegisterError> {
         // Slice off latency seek for MP3 data.
         let (skip_sample_frames, data) = if swf_sound.format.compression == AudioCompression::Mp3 {
             if swf_sound.data.len() < 2 {
@@ -524,11 +567,16 @@ impl AudioMixer {
 
         let sound = Sound {
             format: swf_sound.format.clone(),
-            data: Arc::from(data),
+            data: SoundBytes::new(data, movie),
             num_sample_frames: swf_sound.num_samples,
             skip_sample_frames,
         };
         Ok(self.sounds.insert(sound))
+    }
+
+    // see "AudioBackend::unregister_sound". Instances still playing hold their own reference to the data.
+    pub fn unregister_sound(&mut self, sound: SoundHandle) {
+        self.sounds.remove(sound);
     }
 
     /// Registers an external MP3 with the audio mixer.
@@ -544,7 +592,7 @@ impl AudioMixer {
                 is_stereo: true,
                 is_16_bit: true,
             },
-            data,
+            data: SoundBytes::Owned(data),
             num_sample_frames: metadata.num_sample_frames,
             skip_sample_frames: 0,
         };
@@ -583,8 +631,11 @@ impl AudioMixer {
         sound_handle: SoundHandle,
         settings: &swf::SoundInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        let sound = &self.sounds[sound_handle];
-        let data = Cursor::new(ArcAsRef(Arc::clone(&sound.data)));
+        // "get", the sound may have been unregistered.
+        let Some(sound) = self.sounds.get(sound_handle) else {
+            return Err(decoders::Error::UnregisteredSound);
+        };
+        let data = Cursor::new(sound.data.clone());
         // Create a stream that decodes and resamples the sound.
         let stream = if sound.skip_sample_frames == 0
             && settings.in_sample.is_none()
@@ -605,6 +656,7 @@ impl AudioMixer {
             .lock()
             .expect("Cannot be called reentrant");
         let handle = sound_instances.insert(SoundInstance::new_sound(sound_handle, stream));
+        count_sound_start(sound_handle, settings.num_loops);
         Ok(handle)
     }
 
@@ -684,7 +736,7 @@ impl AudioMixer {
     }
 
     pub fn get_sound_size(&self, sound: SoundHandle) -> Option<u32> {
-        self.sounds.get(sound).map(|s| s.data.len() as u32)
+        self.sounds.get(sound).map(|s| s.data.as_ref().len() as u32)
     }
 
     pub fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat> {
@@ -765,20 +817,54 @@ impl AudioMixerProxy {
     }
 }
 
-/// A dummy wrapper struct to implement `AsRef<[u8]>` for `Arc<Vec<u8>>`.
-/// Not having this trait causes problems when trying to use `Cursor<Vec<u8>>`.
-struct ArcAsRef(Arc<[u8]>);
+/*
+    The bytes of a registered sound (upstream: "ArcAsRef", a copy).
 
-impl AsRef<[u8]> for ArcAsRef {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        &self.0
+    Upstream copies every DefineSound payload out of its movie,
+    which stays alive anyway (a loaded movie is never freed: its "MovieLibrary" holds it),
+    so every embedded sound was held twice, as the images were ("BitmapBytes").
+    Super Smash Flash 2 had ~55 MB of such copies in a heap profile.
+    A sound that lies inside its movie now references it.
+    Should movies become freeable (ruffle PRs #22908, #23071),
+    the mixer, which never drops a sound, would keep them alive through this:
+    copy again then, or unregister the sounds of a freed movie.
+*/
+#[derive(Clone)]
+enum SoundBytes {
+    Owned(Arc<[u8]>),
+    Movie(SwfSlice),
+}
+
+impl SoundBytes {
+    // References "data" inside "movie" when it lies there, else copies it.
+    fn new(data: &[u8], movie: Option<&SwfSlice>) -> Self {
+        if let Some(movie) = movie {
+            let slice = movie.to_unbounded_subslice(data);
+            if !data.is_empty() && slice.end - slice.start == data.len() && slice.end <= slice.movie.data().len()
+            {
+                crate::backend::audio::note_sound_bytes(true, data.len());
+                return Self::Movie(slice);
+            }
+        }
+        crate::backend::audio::note_sound_bytes(false, data.len());
+        Self::Owned(Arc::from(data))
     }
 }
 
-impl Default for ArcAsRef {
+impl AsRef<[u8]> for SoundBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Movie(slice) => slice.data(),
+        }
+    }
+}
+
+// needed by Cursor-based decoders (ADPCM's "reset").
+impl Default for SoundBytes {
     fn default() -> Self {
-        ArcAsRef(Arc::new([]))
+        Self::Owned(Arc::new([]))
     }
 }
 
@@ -1076,6 +1162,16 @@ macro_rules! impl_audio_mixer_backend {
         #[inline]
         fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
             self.$mixer.register_sound(swf_sound)
+        }
+
+        #[inline]
+        fn register_sound_from_movie(&mut self, swf_sound: &swf::Sound, movie: &$crate::tag_utils::SwfSlice, ) -> Result<SoundHandle, RegisterError> {
+            self.$mixer.register_sound_from_movie(swf_sound, movie)
+        }
+
+        #[inline]
+        fn unregister_sound(&mut self, sound: SoundHandle) {
+            self.$mixer.unregister_sound(sound)
         }
 
         #[inline]

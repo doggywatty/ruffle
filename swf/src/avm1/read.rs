@@ -72,6 +72,68 @@ impl<'a> Reader<'a> {
         action
     }
 
+    /*
+        The next action if it is an "ActionPush",
+        its values decoded into "buf" instead of the "Vec" "read_push" allocates
+        (an allocation and a free for every push an AS2 game runs, tens of thousands a frame).
+        Same decoding, errors and length check as "read_action".
+        
+        "None", with nothing consumed, when the next action is not a push or holds more values than "buf".
+        "buf" is left uninitialized past the returned count (a zeroed buffer cost more than the "Vec" it replaces). 
+    */
+    pub fn flashnx_read_push(&mut self, buf: &mut [std::mem::MaybeUninit<Value<'a>>; 16], ) -> Option<Result<usize>> {
+        if self.input.first() != Some(&(OpCode::Push as u8)) {
+            return None;
+        }
+        let saved = self.input;
+        let (opcode, length) = match self.read_opcode_and_length() {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let start = self.input;
+        let end_pos = (start.as_ptr() as usize + length) as *const u8;
+        let mut n = 0;
+        while self.input.as_ptr() < end_pos {
+            let value = match self.flashnx_read_push_value() {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(e) => return Some(Err(Error::avm1_parse_error_with_source(opcode, e))),
+            };
+            if n == buf.len() {
+                self.input = saved;
+                return None;
+            }
+            buf[n].write(value);
+            n += 1;
+        }
+        if !std::ptr::eq(self.input.as_ptr(), end_pos) {
+            self.input = &start[length.min(start.len())..];
+            log::warn!("Length mismatch in AVM1 action: {}", OpCode::format(opcode));
+        }
+        Some(Ok(n))
+    }
+
+    /// One value of an "ActionPush", as "read_push" decodes it ("None": an invalid type, skipped like "read_push" does).
+    #[inline]
+    fn flashnx_read_push_value(&mut self) -> Result<Option<Value<'a>>> {
+        Ok(Some(match self.read_u8()? {
+            0 => Value::Str(self.read_str()?),
+            1 => Value::Float(self.read_f32()?),
+            2 => Value::Null,
+            3 => Value::Undefined,
+            4 => Value::Register(self.read_u8()?),
+            5 => Value::Bool(self.read_u8()? != 0),
+            6 => Value::Double(self.read_f64_me()?),
+            7 => Value::Int(self.read_i32()?),
+            8 => Value::ConstantPool(self.read_u8()?.into()),
+            9 => Value::ConstantPool(self.read_u16()?),
+            type_ => {
+                log::warn!("Invalid value type in ActionPush: {type_}");
+                return Ok(None);
+            }
+        }))
+    }
+
     pub fn read_opcode_and_length(&mut self) -> Result<(u8, usize)> {
         let opcode = self.read_u8()?;
         let length = if opcode >= 0x80 {

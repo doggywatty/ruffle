@@ -30,18 +30,25 @@ pub enum DynamicKey<'gc> {
 ///
 /// Uses `HashTable` directly to expose stable bucket indices, which are
 /// needed for correct iteration when entries are added or removed mid-iteration.
+
+/*
+	16 bytes instead of 48.
+	Every AS3 object holds one, and nearly all of them, instances of sealed classes, never get a dynamic property:
+	the table is allocated with the first one, and the iteration indices are 32 bits.
+	Super Smash Flash 2 keeps millions of small objects (its hitbox caches) and ran out of memory with 600-800 MB of AS3 heap.
+*/
 #[derive(Debug, Clone, Collect)]
 #[collect(no_drop)]
 pub struct DynamicMap<K, V> {
-    table: HashTable<(K, DynamicProperty<V>)>,
+    table: Option<Box<HashTable<(K, DynamicProperty<V>)>>>,
     #[collect(require_static)]
     hasher: FnvBuildHasher,
     // The last index that was given back to flash
     #[collect(require_static)]
-    public_index: Cell<usize>,
+    public_index: Cell<u32>,
     // The actual bucket index that represents where an item is in the table
     #[collect(require_static)]
-    real_index: Cell<usize>,
+    real_index: Cell<u32>,
 }
 
 impl<K: Eq + Hash, V> Default for DynamicMap<K, V> {
@@ -57,7 +64,7 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
 
     pub fn new() -> Self {
         Self {
-            table: HashTable::new(),
+            table: None,
             hasher: FnvBuildHasher::default(),
             public_index: Cell::new(0),
             real_index: Cell::new(0),
@@ -65,41 +72,53 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<&DynamicProperty<V>> {
+        let table = self.table.as_ref()?;
         let hash = self.hash_key(key);
 
-        self.table.find(hash, |(k, _)| k == key).map(|(_, v)| v)
+        table.find(hash, |(k, _)| k == key).map(|(_, v)| v)
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
+        let Some(table) = &self.table else {
+            return false;
+        };
         let hash = self.hash_key(key);
 
-        self.table.find(hash, |(k, _)| k == key).is_some()
+        table.find(hash, |(k, _)| k == key).is_some()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&K, &DynamicProperty<V>)> {
-        self.table.iter().map(|(k, v)| (k, v))
+        self.table.iter().flat_map(|table| table.iter()).map(|(k, v)| (k, v))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.table.iter().map(|(k, _)| k)
+        self.table.iter().flat_map(|table| table.iter()).map(|(k, _)| k)
     }
 
     pub fn len(&self) -> usize {
-        self.table.len()
+        self.table.as_ref().map_or(0, |table| table.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        self.table.as_ref().is_none_or(|table| table.is_empty())
+    }
+
+    fn num_buckets(&self) -> usize {
+        self.table.as_ref().map_or(0, |table| table.num_buckets())
+    }
+
+    fn get_bucket(&self, index: usize) -> Option<&(K, DynamicProperty<V>)> {
+        self.table.as_ref()?.get_bucket(index)
     }
 
     /// Gets the bucket index from the current public index.
     /// Returns `None` if the index is out of bounds.
     fn public_to_real_index(&self, index: usize) -> Option<usize> {
         let mut count = 0;
-        let num_buckets = self.table.num_buckets();
+        let num_buckets = self.num_buckets();
 
         for i in 0..num_buckets {
-            if let Some((_, v)) = self.table.get_bucket(i)
+            if let Some((_, v)) = self.get_bucket(i)
                 && v.enumerable
             {
                 count += 1;
@@ -115,11 +134,10 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
 
     pub fn insert(&mut self, key: K, new_value: V) {
         let hash = self.hash_key(&key);
+        let hasher = &self.hasher;
+        let table = self.table.get_or_insert_with(|| Box::new(HashTable::new()));
 
-        match self
-            .table
-            .entry(hash, |(k, _)| *k == key, |(k, _)| self.hasher.hash_one(k))
-        {
+        match table.entry(hash, |(k, _)| *k == key, |(k, _)| hasher.hash_one(k)) {
             Entry::Occupied(mut occupied) => {
                 // NOTE: When inserting a new value into an already-occupied entry,
                 // the value of the `enumerable` field isn't reset to `true`
@@ -139,8 +157,9 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
 
     pub fn remove(&mut self, key: &K) -> Option<DynamicProperty<V>> {
         let hash = self.hash_key(key);
+        let table = self.table.as_mut()?;
 
-        match self.table.find_entry(hash, |(k, _)| k == key) {
+        match table.find_entry(hash, |(k, _)| k == key) {
             Ok(occupied) => Some(occupied.remove().0.1),
             Err(_) => None,
         }
@@ -157,7 +176,7 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
         // Start iteration from the beginning
         if index == 0 {
             if let Some(real) = self.public_to_real_index(1) {
-                self.real_index.set(real);
+                self.real_index.set(real as u32);
                 self.public_index.set(1);
                 return Some(1);
             } else {
@@ -170,12 +189,12 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
         // if index != self.public_index, then we are enumerating twice OR we mutated while enumerating.
         //
         // Regardless of the reason, we just need to sync the supplied index to the real index.
-        if self.public_index.get() == 0 || index != self.public_index.get() {
+        if self.public_index.get() == 0 || index != self.public_index.get() as usize {
             if let Some(real) = self.public_to_real_index(index) {
                 // Pick up where we left off in the iteration
                 // See https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/avmplusHashtable.cpp#L395
-                self.real_index.set(real);
-                self.public_index.set(index);
+                self.real_index.set(real as u32);
+                self.public_index.set(index as u32);
             } else {
                 self.public_index.set(0);
                 self.real_index.set(0);
@@ -183,17 +202,17 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
             }
         }
 
-        let real = self.real_index.get() + 1;
-        let num_buckets = self.table.num_buckets();
+        let real = self.real_index.get() as usize + 1;
+        let num_buckets = self.num_buckets();
 
-        if !self.table.is_empty() && real < num_buckets {
+        if !self.is_empty() && real < num_buckets {
             for i in real..num_buckets {
-                if let Some((_, v)) = self.table.get_bucket(i)
+                if let Some((_, v)) = self.get_bucket(i)
                     && v.enumerable
                 {
-                    self.real_index.set(i);
+                    self.real_index.set(i as u32);
                     self.public_index.set(self.public_index.get() + 1);
-                    return Some(self.public_index.get());
+                    return Some(self.public_index.get() as usize);
                 }
             }
         }
@@ -202,13 +221,14 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
     }
 
     pub fn pair_at(&self, index: usize) -> Option<&(K, DynamicProperty<V>)> {
-        let real_index = if self.public_index.get() == 0 || self.public_index.get() != index {
-            self.public_to_real_index(index)?
-        } else {
-            self.real_index.get()
-        };
+        let real_index =
+            if self.public_index.get() == 0 || self.public_index.get() as usize != index {
+                self.public_to_real_index(index)?
+            } else {
+                self.real_index.get() as usize
+            };
 
-        self.table.get_bucket(real_index)
+        self.get_bucket(real_index)
     }
 
     pub fn key_at(&self, index: usize) -> Option<&K> {
@@ -222,7 +242,8 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
     pub fn set_enumerable(&mut self, key: &K, enumerable: bool) {
         let hash = self.hash_key(key);
 
-        if let Some((_, prop)) = self.table.find_mut(hash, |(k, _)| k == key) {
+        if let Some((_, prop)) = self.table.as_mut().and_then(|table| table.find_mut(hash, |(k, _)| k == key))
+        {
             prop.enumerable = enumerable;
         }
     }

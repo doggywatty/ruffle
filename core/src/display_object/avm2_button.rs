@@ -100,6 +100,11 @@ pub struct Avm2ButtonData<'gc> {
 }
 
 impl<'gc> Avm2Button<'gc> {
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared)
+    }
+
     pub fn from_swf_tag(
         button: &swf::Button,
         source_movie: &SwfSlice,
@@ -563,6 +568,14 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         for state in self.all_state_children(self.0.weird_framescript_order.take()) {
             state.run_frame_scripts(context);
+        }
+        /*
+            A button is never passed over by an inner goto (see "skipping_clean_subtrees"), nor anything above it:
+            its inactive states have no parent, so a change inside them would not mark it.
+        */
+        self.base().set_lifecycle_dirty(true);
+        if self.parent().is_none() {
+            crate::display_object::queue_dirty_orphan(self.into());
         }
     }
 

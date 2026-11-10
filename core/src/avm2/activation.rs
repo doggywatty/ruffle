@@ -57,7 +57,9 @@ pub struct Activation<'a, 'gc: 'a> {
     /// The movie that called this builtin method.
     /// This is intended to be used only for builtin methods- if this activation's method
     /// is a bytecode method, the movie will instead be the movie that the bytecode method came from.
-    caller_movie: Option<Arc<SwfMovie>>,
+    
+	// Kept as the method itself for bytecode activations (see CallerMovie)
+    caller_movie: CallerMovie<'gc>,
 
     /// The superclass of the class that yielded the currently executing method.
     ///
@@ -102,6 +104,116 @@ pub struct Activation<'a, 'gc: 'a> {
     pub context: &'a mut UpdateContext<'gc>,
 }
 
+/*
+	Where "Activation::caller_movie()" comes from.
+	
+	Upstream stores an "Arc<SwfMovie>" cloned from the method on EVERY bytecode call and drops it when the call returns:
+	2 atomic read-modify-write loops per call on the Switch's ARMv8.0 cores (no LSE atomics), ~2 % of Fireboy & Watergirl 2's frame at 47 000 calls per frame.
+	The method is kept instead, and the movie is only looked up when a builtin actually asks for it.
+*/
+#[derive(Clone)]
+pub enum CallerMovie<'gc> {
+    None,
+    Method(Method<'gc>),
+    Movie(Arc<SwfMovie>),
+}
+
+/*
+	The cheaper AVM2 call path ("CallerMovie", the receiver check left to debug builds, only the locals of a new stack frame cleared).
+	On by default, the "fastcall.off" marker or the profiling build's A/B turn it off.
+*/
+static FAST_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_fast_calls(on: bool) {
+    FAST_CALLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn fast_calls() -> bool {
+    FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Baseline JIT for AVM2 bytecode (see activation_jit.rs)
+#[cfg(feature = "flashnx_jit")]
+#[path = "activation_jit.rs"]
+mod jit;
+
+/*
+	Run compiled methods (on by default, "jit.off" marker, or the profiling build's A/B).
+	Methods already compiled are kept either way.
+*/
+pub fn set_jit(on: bool) {
+    #[cfg(feature = "flashnx_jit")]
+    jit::set_enabled(on);
+    #[cfg(not(feature = "flashnx_jit"))]
+    let _ = on;
+}
+
+// Compiled "callmethod" enters compiled callees directly (on by default, the profiling build's A/B switches it).
+pub fn set_jit_direct_calls(on: bool) {
+    #[cfg(feature = "flashnx_jit")]
+    jit::set_direct_calls(on);
+    #[cfg(not(feature = "flashnx_jit"))]
+    let _ = on;
+}
+
+// A new game starts, the JIT's code memory is free again (call it only once the previous game's player is gone).
+pub fn jit_reset() {
+    #[cfg(feature = "flashnx_jit")]
+    jit::reset();
+}
+
+// The stack cache of compiled code (on by default, "jittos.off").
+pub fn set_jit_tos_cache(on: bool) {
+    #[cfg(feature = "flashnx_jit")]
+    jit::set_tos_cache(on);
+    #[cfg(not(feature = "flashnx_jit"))]
+    let _ = on;
+}
+
+// Profiling build: compile every method a second time without the stack cache (dual), and run that second code (alt) in the A/B's other windows.
+pub fn set_jit_ab(dual: bool, alt: bool) {
+    #[cfg(feature = "flashnx_jit")]
+    {
+        jit::set_dual(dual);
+        jit::set_alt(alt);
+    }
+    #[cfg(not(feature = "flashnx_jit"))]
+    let _ = (dual, alt);
+}
+
+// Profiling build: Keep where each compiled op's code starts.
+pub fn set_jit_map(on: bool) {
+    #[cfg(feature = "flashnx_jit")]
+    jit::set_map(on);
+    #[cfg(not(feature = "flashnx_jit"))]
+    let _ = on;
+}
+
+// "<address hex> <op>" per compiled op since the last reset, for the profiler to name the ops its samples in compiled code fall in.
+pub fn jit_map_text() -> String {
+    #[cfg(feature = "flashnx_jit")]
+    {
+        jit::map_text()
+    }
+    #[cfg(not(feature = "flashnx_jit"))]
+    {
+        String::new()
+    }
+}
+
+// 1 line of JIT counters (jit:), empty without the JIT.
+pub fn jit_report() -> String {
+    #[cfg(feature = "flashnx_jit")]
+    {
+        jit::report()
+    }
+    #[cfg(not(feature = "flashnx_jit"))]
+    {
+        String::new()
+    }
+}
+
 impl<'gc> HasStringContext<'gc> for Activation<'_, 'gc> {
     #[inline(always)]
     fn strings_ref(&self) -> &StringContext<'gc> {
@@ -135,7 +247,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             num_locals: 0,
             outer: ScopeChain::new(context.avm2.stage_domain),
             caller_domain: None,
-            caller_movie: None,
+            caller_movie: CallerMovie::None,
             bound_superclass_object: None,
             stack: StackFrame::empty(),
             scope_depth: context.avm2.scope_stack.len(),
@@ -159,7 +271,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             num_locals: 0,
             outer: ScopeChain::new(context.avm2.stage_domain),
             caller_domain: Some(domain),
-            caller_movie: None,
+            caller_movie: CallerMovie::None,
             bound_superclass_object: None,
             stack: StackFrame::empty(),
             scope_depth: context.avm2.scope_stack.len(),
@@ -214,8 +326,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         method: Method<'gc>,
         user_arguments: FunctionArgs<'_, 'gc>,
         signature: &[ResolvedParamConfig<'gc>],
-    ) -> Result<Vec<Value<'gc>>, Error<'gc>> {
-        let mut arguments_list = Vec::new();
+    ) -> Result<smallvec::SmallVec<[Value<'gc>; 8]>, Error<'gc>> {
+		/*
+			Inline storage for up to 8 arguments.
+			Upstream allocates a Vec here on every native call that takes an argument (setters, addEventListener, dispatchEvent, hitTest...):
+			ruffle#24542 removes it by reworking every native's signature, this gets the same "no heap allocation" without touching them.
+		*/
+        let mut arguments_list = smallvec::SmallVec::new();
         for (arg, param_config) in user_arguments.iter().zip(signature.iter()) {
             let coerced_arg = if let Some(param_class) = param_config.param_type {
                 arg.coerce_to_type(self, param_class)?
@@ -343,14 +460,21 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let num_locals = body.num_locals as usize;
         let has_rest_or_args = method.is_variadic();
 
-        if let Some(bound_class) = method.bound_class() {
-            assert!(this.is_of_type(bound_class));
+        let fast = fast_calls();
+        if !fast || cfg!(debug_assertions) {
+            if let Some(bound_class) = method.bound_class() {
+                assert!(this.is_of_type(bound_class));
+            }
         }
 
         self.num_locals = num_locals;
         self.outer = outer;
         self.caller_domain = Some(outer.domain());
-        self.caller_movie = Some(method.owner_movie());
+        self.caller_movie = if fast {
+            CallerMovie::Method(method)
+        } else {
+            CallerMovie::Movie(method.owner_movie())
+        };
         self.bound_superclass_object = bound_superclass_object;
         self.stack = stack_frame;
         self.scope_depth = self.context.avm2.scope_stack.len();
@@ -438,7 +562,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         bound_superclass_object: Option<ClassObject<'gc>>,
         outer: ScopeChain<'gc>,
         caller_domain: Option<Domain<'gc>>,
-        caller_movie: Option<Arc<SwfMovie>>,
+        caller_movie: CallerMovie<'gc>,
         caller_dxns: Option<AvmString<'gc>>,
     ) -> Self {
         Self {
@@ -519,6 +643,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     /// Returns the movie of the original AS3 caller. This will be `None`
     /// if this activation was constructed with `from_nothing`
     pub fn caller_movie(&self) -> Option<Arc<SwfMovie>> {
+        match &self.caller_movie {
+            CallerMovie::None => None,
+            CallerMovie::Method(method) => Some(method.owner_movie()),
+            CallerMovie::Movie(movie) => Some(movie.clone()),
+        }
+    }
+
+    // What a builtin called from here gets as its caller movie, without cloning the "Arc" when it is a bytecode method's.
+    pub fn caller_movie_source(&self) -> CallerMovie<'gc> {
         self.caller_movie.clone()
     }
 
@@ -643,6 +776,23 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        #[cfg(feature = "flashnx_jit")]
+        if jit::enabled() {
+            match jit::run(self, method) {
+                jit::Outcome::Done(result) => return result,
+                // The JIT handed over mid-method: the stack is the interpreter's.
+                jit::Outcome::Resume(ip) => return self.run_actions_from(method, ip),
+                jit::Outcome::Interpret => {}
+            }
+        }
+        self.run_actions_from(method, 0)
+    }
+
+    fn run_actions_from(
+        &mut self,
+        method: Method<'gc>,
+        start_ip: usize,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         // The method must be verified at this point
 
         let verified_info = method.get_verified_info();
@@ -650,12 +800,14 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         self.timeout_check()?;
 
-        let mut ip = 0;
+        let mut ip = start_ip;
 
         loop {
             let op = &opcodes[ip];
             ip += 1;
             avm_debug!(self.avm2(), "Opcode: {op:?}");
+            #[cfg(feature = "flashnx_opcount")]
+            crate::flashnx_avm2ops::count(core::intrinsics::discriminant_value(op) as usize, op);
 
             let result = match op {
                 Op::PushDouble { value } => self.op_push_double(*value),
@@ -946,12 +1098,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 10000 {
             *self.context.actions_since_timeout_check = 0;
-            if self.context.update_start.elapsed() >= self.context.max_execution_duration {
+            if self.context.update_start.elapsed() >= *self.context.max_execution_duration {
                 return Err(
                     "A script in this movie has taken too long to execute and has been terminated."
                         .into(),
                 );
             }
+            /*
+				The frontend's pause, opened from here while the frame computes ("flashnx_script_hook").
+				The time it was up is not the script's.
+			*/
+            let elapsed = self.context.update_start.elapsed();
+            let (stop, held) = crate::player::flashnx_script_hook(elapsed, &mut *self.context.renderer);
+            if stop {
+                return Err("A script in this movie was stopped from the pause.".into());
+            }
+            self.context.update_start += held;
         }
         Ok(())
     }
@@ -2023,6 +2185,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     ((n1 as i64 + n2 as i64) as f64).into()
                 }
             }
+            // Backport of upstream ruffle#24211 (mixed int/Number fast paths, inlined abstract_lt, exact results kept as int).
+            (Value::Integer(n1), Value::Number(n2)) => (n1 as f64 + n2).into(),
+            (Value::Number(n1), Value::Integer(n2)) => (n1 + n2 as f64).into(),
             (Value::Number(n1), Value::Number(n2)) => (n1 + n2).into(),
             (Value::String(s), value2) => Value::String(AvmString::concat(
                 self.gc(),
@@ -2072,11 +2237,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(())
     }
 
+    // Backport of upstream ruffle#23840 (integer fast paths for add_i/subtract_i, coerce_a as a nop, int/uint/Number merge to Number).
     fn op_add_i(&mut self) -> Result<(), Error<'gc>> {
-        let value2 = self.pop_stack().coerce_to_i32(self)?;
-        let value1 = self.pop_stack().coerce_to_i32(self)?;
+        let value2 = self.pop_stack();
+        let value1 = self.pop_stack();
 
-        self.push_stack(value1.wrapping_add(value2));
+        let sum_value = match (value1, value2) {
+            (Value::Integer(n1), Value::Integer(n2)) => n1.wrapping_add(n2),
+            (value1, value2) => {
+                let value1 = value1.coerce_to_i32(self)?;
+                let value2 = value2.coerce_to_i32(self)?;
+
+                value1.wrapping_add(value2)
+            }
+        };
+
+        self.push_stack(sum_value);
 
         Ok(())
     }
@@ -2134,8 +2310,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_decrement(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value - 1.0);
 
-        self.push_stack(value - 1.0);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
@@ -2151,8 +2328,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_divide(&mut self) -> Result<(), Error<'gc>> {
         let value2 = self.pop_stack().coerce_to_number(self)?;
         let value1 = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value1 / value2);
 
-        self.push_stack(value1 / value2);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
@@ -2175,8 +2353,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_increment(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value + 1.0);
 
-        self.push_stack(value + 1.0);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
@@ -2274,6 +2453,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     ((n1 as i64 - n2 as i64) as f64).into()
                 }
             }
+            (Value::Integer(n1), Value::Number(n2)) => (n1 as f64 - n2).into(),
+            (Value::Number(n1), Value::Integer(n2)) => (n1 - n2 as f64).into(),
             (Value::Number(n1), Value::Number(n2)) => (n1 - n2).into(),
             _ => {
                 let value2 = value2.coerce_to_number(self)?;
@@ -2288,10 +2469,20 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     fn op_subtract_i(&mut self) -> Result<(), Error<'gc>> {
-        let value2 = self.pop_stack().coerce_to_i32(self)?;
-        let value1 = self.pop_stack().coerce_to_i32(self)?;
+        let value2 = self.pop_stack();
+        let value1 = self.pop_stack();
 
-        self.push_stack(value1.wrapping_sub(value2));
+        let sum_value = match (value1, value2) {
+            (Value::Integer(n1), Value::Integer(n2)) => n1.wrapping_sub(n2),
+            (value1, value2) => {
+                let value1 = value1.coerce_to_i32(self)?;
+                let value2 = value2.coerce_to_i32(self)?;
+
+                value1.wrapping_sub(value2)
+            }
+        };
+
+        self.push_stack(sum_value);
 
         Ok(())
     }

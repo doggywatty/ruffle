@@ -11,7 +11,7 @@ use ruffle_macros::istr;
 
 use super::class::Class;
 
-#[derive(Debug, Collect, Clone, Copy)]
+#[derive(Debug, Collect, Clone, Copy, PartialEq, Eq)]
 #[collect(no_drop)]
 pub enum Property {
     Virtual {

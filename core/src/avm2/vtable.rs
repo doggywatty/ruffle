@@ -20,14 +20,23 @@ use std::collections::HashMap;
 #[collect(no_drop)]
 pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 
-#[derive(Collect, Default)]
+#[derive(Collect)]
 #[collect(no_drop)]
 struct VTableData<'gc> {
     scope: Option<ScopeChain<'gc>>,
 
     protected_namespace: Option<Namespace<'gc>>,
 
-    resolved_traits: PropertyMap<'gc, Property>,
+    /*
+        Shared.
+        Every class gets its traits resolved twice with the same inputs:
+        for its "Class" ("TranslationUnit::load_class") and again for its "ClassObject" ("init_instance_vtable", "into_finished_class"),
+        and a script's global class likewise.
+        The second map is identical, so it reuses the first (see "VTableBuild::finish").
+        Never changed once built.
+        A heap profile of Super Smash Flash 2 (thousands of symbol classes, each copying ~400 inherited entries) had ~400 MB in these maps.
+    */
+    resolved_traits: Gc<'gc, PropertyMap<'gc, Property>>,
 
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
     slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
@@ -70,9 +79,52 @@ impl<'gc> ClassBoundMethod<'gc> {
     }
 }
 
+// "VTableData" being built: its traits are still a plain map, turned into a shared one by "finish".
+struct VTableBuild<'gc> {
+    scope: Option<ScopeChain<'gc>>,
+    protected_namespace: Option<Namespace<'gc>>,
+    resolved_traits: PropertyMap<'gc, Property>,
+    slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
+    disp_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
+    slot_table: Box<[SlotInfo<'gc>]>,
+    method_table: Box<[ClassBoundMethod<'gc>]>,
+}
+
+impl<'gc> VTableBuild<'gc> {
+    // Reuse the traits map the defining class already has when this one came out equal (always, for the second resolution of a class), else keep this one.
+    fn finish(self, defining_class_def: Class<'gc>, mc: &Mutation<'gc>) -> VTableData<'gc> {
+        let resolved_traits = match defining_class_def.vtable_if_initialized() {
+            Some(existing) if *existing.resolved_traits() == self.resolved_traits => {
+                existing.0.resolved_traits
+            }
+            _ => Gc::new(mc, self.resolved_traits),
+        };
+        VTableData {
+            scope: self.scope,
+            protected_namespace: self.protected_namespace,
+            resolved_traits,
+            slot_metadata_table: self.slot_metadata_table,
+            disp_metadata_table: self.disp_metadata_table,
+            slot_table: self.slot_table,
+            method_table: self.method_table,
+        }
+    }
+}
+
 impl<'gc> VTable<'gc> {
     pub fn empty(mc: &Mutation<'gc>) -> Self {
-        VTable(Gc::new(mc, VTableData::default()))
+        VTable(Gc::new(
+            mc,
+            VTableData {
+                scope: None,
+                protected_namespace: None,
+                resolved_traits: Gc::new(mc, PropertyMap::new()),
+                slot_metadata_table: HashMap::new(),
+                disp_metadata_table: HashMap::new(),
+                slot_table: Box::new([]),
+                method_table: Box::new([]),
+            },
+        ))
     }
 
     /// Builds a new vtable by calculating the flattened list of instance traits
@@ -90,7 +142,7 @@ impl<'gc> VTable<'gc> {
             scope,
             superclass_vtable,
         )?;
-        Ok(VTable(Gc::new(mc, this)))
+        Ok(VTable(Gc::new(mc, this.finish(defining_class_def, mc))))
     }
 
     /// Like `VTable::new`, but also copies properties from the defining class' interfaces.
@@ -109,11 +161,11 @@ impl<'gc> VTable<'gc> {
         )?;
         Self::copy_interface_properties(&mut this, defining_class_def, context);
 
-        Ok(VTable(Gc::new(context.gc(), this)))
+        Ok(VTable(Gc::new(context.gc(), this.finish(defining_class_def, context.gc()), )))
     }
 
     pub fn resolved_traits(self) -> &'gc PropertyMap<'gc, Property> {
-        &Gc::as_ref(self.0).resolved_traits
+        Gc::as_ref(Gc::as_ref(self.0).resolved_traits)
     }
 
     pub fn get_metadata_for_slot(self, slot_id: usize) -> Option<&'gc [Metadata<'gc>]> {
@@ -228,7 +280,7 @@ impl<'gc> VTable<'gc> {
         super_class_obj: Option<ClassObject<'gc>>,
         scope: Option<ScopeChain<'gc>>,
         superclass_vtable: Option<Self>,
-    ) -> Result<VTableData<'gc>, VTableInitError> {
+    ) -> Result<VTableBuild<'gc>, VTableInitError> {
         // Let's talk about slot_ids and disp_ids.
         // Specification is one thing, but reality is another.
 
@@ -532,7 +584,7 @@ impl<'gc> VTable<'gc> {
             }
         }
 
-        Ok(VTableData {
+        Ok(VTableBuild {
             scope,
             protected_namespace: defining_class_def.protected_namespace(),
             resolved_traits,
@@ -544,7 +596,7 @@ impl<'gc> VTable<'gc> {
     }
 
     fn copy_interface_properties(
-        this: &mut VTableData<'gc>,
+        this: &mut VTableBuild<'gc>,
         class: Class<'gc>,
         context: &UpdateContext<'gc>,
     ) {

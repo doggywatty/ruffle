@@ -215,7 +215,13 @@ impl<'gc> LoaderInfoObject<'gc> {
                     root.as_movie_clip()
                         .map(|mc| mc.loaded_bytes() as i32 >= mc.total_bytes())
                         .unwrap_or(true),
-                    movie.url() != "file:///",
+                    /*
+                        A movie from "Loader.loadBytes" gets no httpStatus: since the loadBytes URL backport (loader.rs)
+                        
+                        An AS3 one is "<loader>/[[DYNAMIC]]/1", not "file:///".
+                        Upstream stores the fact on SwfMovie instead (f8509a30f).
+                    */
+                    movie.url() != "file:///" && !movie.url().contains("/[[DYNAMIC]]/"),
                 ),
                 _ => (false, false),
             };
@@ -264,6 +270,11 @@ impl<'gc> LoaderInfoObject<'gc> {
     }
 
     pub fn unload(self, context: &mut UpdateContext<'gc>) {
+        // The unloaded movie's library is kept only while something still uses the movie (see "Library::release_movie").
+        if let LoaderStream::Swf(movie, root) = &*self.loader_stream() {
+            context.library.release_movie(movie, root.as_movie_clip());
+        }
+
         // Reset properties
         let movie = &context.root_swf;
         let empty_swf = Arc::new(SwfMovie::empty(movie.version(), Some(movie.url().into())));

@@ -40,6 +40,11 @@ pub struct TextData<'gc> {
 }
 
 impl<'gc> Text<'gc> {
+    // See "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared.get())
+    }
+
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,
         swf: Arc<SwfMovie>,

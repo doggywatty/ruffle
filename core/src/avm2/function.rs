@@ -200,10 +200,19 @@ pub fn exec<'gc>(
 
     let caller_dxns = activation.default_xml_namespace();
 
+    // Per-method timing, off unless "as3prof.on" (see flashnx_as3prof).
+    let _as3prof = crate::flashnx_as3prof::Guard::enter(
+		method.flashnx_key(), matches!(method.method_kind(), MethodKind::Native { .. }), || {
+			let mut name = WString::new();
+			display_function(&mut name, method);
+			name.to_utf8_lossy().into_owned()
+		},
+    );
+
     let ret = match method.method_kind() {
         MethodKind::Native { native_method, .. } => {
             let caller_domain = activation.caller_domain();
-            let caller_movie = activation.caller_movie();
+            let caller_movie = activation.caller_movie_source();
             let mut activation = Activation::from_builtin(
                 activation.context,
                 bound_superclass,
@@ -237,6 +246,9 @@ pub fn exec<'gc>(
             };
 
             activation.context.avm2.push_call(mc, method);
+
+            #[cfg(feature = "flashnx_opcount")]
+            crate::flashnx_avm2ops::native_call();
 
             native_method(&mut activation, receiver, &arguments)
         }
@@ -281,6 +293,9 @@ pub fn exec<'gc>(
             };
 
             activation.context.avm2.push_call(mc, method);
+
+            #[cfg(feature = "flashnx_opcount")]
+            crate::flashnx_avm2ops::bytecode_call(method.get_verified_info().parsed_code.len());
 
             let result = activation.run_actions(method);
 

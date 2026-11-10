@@ -63,6 +63,11 @@ struct Avm1ButtonDataMut<'gc> {
 }
 
 impl<'gc> Avm1Button<'gc> {
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared)
+    }
+
     pub fn from_swf_tag(button: &swf::Button, source_movie: &SwfSlice, mc: &Mutation<'gc>) -> Self {
         let actions = button
             .actions

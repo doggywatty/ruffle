@@ -6,7 +6,7 @@ use crate::bitmap::bitmap_data::{
     BitmapData, BitmapDataDrawError, BitmapRawData, ChannelOptions, Color, IBitmapDrawable,
     LehmerRng, ThresholdOperation,
 };
-use crate::bitmap::turbulence::Turbulence;
+use crate::bitmap::turbulence::{Turbulence, TurbulenceSetup};
 use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::{RenderOptions, TDisplayObject};
 use gc_arena::Mutation;
@@ -273,73 +273,53 @@ pub fn perlin_noise<'gc>(
         if base.1 == 0.0 { 0.0 } else { 1.0 / base.1 },
     );
 
+    /*
+        The stitching setup and the list of channels are the same for every pixel,
+        and one "turbulence_channels" call per pixel does every channel (see "Turbulence::turbulence_channels", same numbers).
+    */
+    let setup = TurbulenceSetup::new(base_freq, stitch, (0.0, 0.0), (write.width() as f64, write.height() as f64), );
+    let gray_alpha = channel_options.contains(ChannelOptions::ALPHA);
+
+    /*
+        Flash seems to pass the "color_channel" parameter to "turbulence" somewhat strangely.
+        It's not always r = 0, g = 1, b = 2, a = 3:
+        instead, it skips incrementing the parameter after channels that are not included in "channel_options":
+        the n included channels, in order, get the noise of `turbulence` channels 0..n.
+    */
+    let mut color_dest: Vec<usize> = Vec::with_capacity(4);
+    for c in 0..4 {
+        // "c" is always in 0..4, so "1 << c" is never actually truncated here
+        if channel_options.contains(ChannelOptions::from_bits_truncate(1 << c)) {
+            color_dest.push(c);
+        }
+    }
+    let channels: &[usize] = if grayscale {
+        if gray_alpha { &[0, 1] } else { &[0] }
+    } else {
+        &[0, 1, 2, 3][..color_dest.len()]
+    };
+
     for y in 0..write.height() {
         for x in 0..write.width() {
             let px = x as f64;
             let py = y as f64;
 
             let mut noise = [0.0; 4];
+            let mut out = [0.0; 4];
+            turb.turbulence_channels(channels, (px, py), &setup, num_octaves, fractal_noise, &offsets, &mut out, );
 
             // grayscale mode is different enough to warrant its own branch
             if grayscale {
-                noise[0] = turb.turbulence(
-                    0,
-                    (px, py),
-                    base_freq,
-                    num_octaves,
-                    fractal_noise,
-                    stitch,
-                    (0.0, 0.0),
-                    (write.width() as f64, write.height() as f64),
-                    &offsets,
-                );
-
+                noise[0] = out[0];
                 noise[1] = noise[0];
                 noise[2] = noise[0];
-
-                noise[3] = if channel_options.contains(ChannelOptions::ALPHA) {
-                    turb.turbulence(
-                        1,
-                        (px, py),
-                        base_freq,
-                        num_octaves,
-                        fractal_noise,
-                        stitch,
-                        (0.0, 0.0),
-                        (write.width() as f64, write.height() as f64),
-                        &offsets,
-                    )
-                } else {
-                    1.0
-                };
+                noise[3] = if gray_alpha { out[1] } else { 1.0 };
             } else {
-                // Flash seems to pass the `color_channel` parameter to `turbulence`
-                // somewhat strangely. It's not always r=0, g=1, b=2, a=3; instead,
-                // it skips incrementing the parameter after channels that are
-                // not included in `channel_options`.
-                let mut channel = 0;
-
-                for (c, noise_c) in noise.iter_mut().enumerate() {
-                    // this will work both in fractal_sum and turbulence "modes",
-                    // because of the saturating conversion to u8
-                    *noise_c = if c == 3 { 1.0 } else { -1.0 };
-
-                    // `c` is always in 0..4, so `1 << c` is never actually truncated here
-                    let c = ChannelOptions::from_bits_truncate(1 << c);
-                    if channel_options.contains(c) {
-                        *noise_c = turb.turbulence(
-                            channel,
-                            (px, py),
-                            base_freq,
-                            num_octaves,
-                            fractal_noise,
-                            stitch,
-                            (0.0, 0.0),
-                            (write.width() as f64, write.height() as f64),
-                            &offsets,
-                        );
-                        channel += 1;
-                    }
+                // this will work both in fractal_sum and turbulence "modes",
+                // because of the saturating conversion to u8
+                noise = [-1.0, -1.0, -1.0, 1.0];
+                for (k, &c) in color_dest.iter().enumerate() {
+                    noise[c] = out[k];
                 }
             }
 
@@ -551,7 +531,6 @@ pub fn threshold<'gc>(
     // The number of modified pixels
     // This doesn't seem to include pixels changed due to copy_source
     let mut modified_count = 0;
-    let mut dirty_area: Option<PixelRegion> = None;
 
     let mut source_region =
         PixelRegion::for_whole_size(source_bitmap.width(), source_bitmap.height());
@@ -567,59 +546,168 @@ pub fn threshold<'gc>(
         return 0;
     }
 
-    let source = if source_bitmap.ptr_eq(target) {
+    let self_source = source_bitmap.ptr_eq(target);
+    let source = if self_source {
         None
     } else {
         Some(source_bitmap.read_area(source_region, renderer))
     };
 
     let target = target.sync(renderer);
+    /*
+        A bitmap thresholded onto itself, with exactly the arguments of a call that matched nothing, and not touched since:
+        it matches nothing again, so skip the scan (see "ThresholdMemo").
+        Only onto itself, where those arguments and these pixels are all there is to the result.
+    */
+    let memo_key = self_source.then_some(crate::bitmap::bitmap_data::ThresholdKey {
+        src_rect,
+        dest_point,
+        operation: operation as u8,
+        threshold,
+        colour,
+        mask,
+        copy_source,
+    });
+    if let Some(key) = &memo_key {
+        if target.borrow().threshold_known_noop(key) {
+            THRESHOLD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            THRESHOLD_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            THRESHOLD_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+    }
     let mut write = target.borrow_mut(mc);
+    let generation_before = write.generation();
 
-    // Check each pixel
+    /*
+        The same pixels, visited in the same order, with the same result,
+        minus the per-pixel overhead that made this 14 % of a Super Smash Flash 2 fight frame: 
+        the colour was converted to premultiplied alpha for very matching pixel,
+        the dirty area grown one pixel at a time (it always ends up as "dest_region"),
+        and every read and write recomputed its index.
+    
+        Rows are now slices: when the source is the target itself,
+        each pixel is still read just before its own write, so an overlap behaves as before.
+        
+        [NA] Spot the bug? We don't set the alpha to 0xFF for opaque BMDs. Yay flash.
+    */
+    let fill = Color::from(colour).to_premultiplied_alpha(true);
+    let width = dest_region.width() as usize;
+    let dest_stride = write.width() as usize;
+
+    /*
+        Onto itself at the same place (Super Smash Flash 2's palette recolouring, ~8 % of its heavy frames),
+        a non-matching pixel copied onto itself is unchanged:
+        only the matches are written, in a loop specialised for the operation ("threshold_in_place"), same pixels and count.
+    */
+    if source.is_none() && source_region == dest_region {
+        let pixels = write.raw_pixels_mut();
+        for y in 0..dest_region.height() {
+            let start = (dest_region.y_min + y) as usize * dest_stride + dest_region.x_min as usize;
+            modified_count += threshold_in_place(&mut pixels[start..start + width], operation, mask, masked_threshold, fill, );
+        }
+    } else {
     for y in 0..dest_region.height() {
-        for x in 0..dest_region.width() {
-            let dest_x = dest_region.x_min + x;
-            let dest_y = dest_region.y_min + y;
-            let src_x = source_region.x_min + x;
-            let src_y = source_region.y_min + y;
-
-            // Extract source colour
-            let source_color = if let Some(source) = &source {
-                source.get_pixel32_raw(src_x, src_y)
-            } else {
-                write.get_pixel32_raw(src_x, src_y)
-            };
-
-            // If the test, as defined by the operation pass then set to input colour
-            if operation.matches(u32::from(source_color) & mask, masked_threshold) {
-                modified_count += 1;
-                // [NA] Spot the bug? We don't set the alpha to 0xFF for opaque BMDs. Yay flash.
-                write.set_pixel32_raw(
-                    dest_x,
-                    dest_y,
-                    Color::from(colour).to_premultiplied_alpha(true),
-                );
-            } else {
-                // If the test fails, but copy_source is true then take the colour from the source
-                if copy_source {
-                    // [NA] Spot the bug? We don't set the alpha to 0xFF for opaque BMDs. Yay flash.
-                    write.set_pixel32_raw(dest_x, dest_y, source_color);
+        let dest_start = (dest_region.y_min + y) as usize * dest_stride + dest_region.x_min as usize;
+        if let Some(source) = &source {
+            let src_stride = source.width() as usize;
+            let src_start =
+                (source_region.y_min + y) as usize * src_stride + source_region.x_min as usize;
+            let src_row = &source.raw_pixels()[src_start..src_start + width];
+            let dest_row = &mut write.raw_pixels_mut()[dest_start..dest_start + width];
+            for (dest, &source_color) in dest_row.iter_mut().zip(src_row) {
+                if operation.matches(u32::from(source_color) & mask, masked_threshold) {
+                    modified_count += 1;
+                    *dest = fill;
+                } else if copy_source {
+                    *dest = source_color;
                 }
             }
-            if let Some(dirty_area) = &mut dirty_area {
-                dirty_area.encompass(dest_x, dest_y);
-            } else {
-                dirty_area = Some(PixelRegion::for_pixel(dest_x, dest_y));
+        } else {
+            let src_start = (source_region.y_min + y) as usize * dest_stride + source_region.x_min as usize;
+            let pixels = write.raw_pixels_mut();
+            for x in 0..width {
+                let source_color = pixels[src_start + x];
+                if operation.matches(u32::from(source_color) & mask, masked_threshold) {
+                    modified_count += 1;
+                    pixels[dest_start + x] = fill;
+                } else if copy_source {
+                    pixels[dest_start + x] = source_color;
+                }
             }
         }
     }
+    }
 
-    if let Some(dirty_area) = dirty_area {
-        write.set_cpu_dirty(mc, dirty_area);
+    /*
+        Every visited pixel counted towards the dirty area, so it is the whole destination region (never empty here: that returned early above).
+
+        Unless nothing was written.
+        Super Smash Flash 2 recolours each fighter every frame with 1 threshold(bmd, rect, pt, "==", colour, replacement, mask, copySource=true) per palette colour,
+        on the pose's bitmap itself:
+        after the first pass no pixel matches any more and the copy is the bitmap onto itself,
+        yet the dirty mark sent the whole bitmap back to the GPU every call.
+        No match and no copy, or a copy of the region onto itself, leaves every pixel as it was.
+    */
+    let unchanged = modified_count == 0 && (!copy_source || (source.is_none() && source_region == dest_region));
+    THRESHOLD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if unchanged {
+        THRESHOLD_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The scan took "raw_pixels_mut", which bumps the generation: no pixel changed, so the bitmap is still the one it was before.
+        write.restore_generation(generation_before);
+        if let (Some(key), true) = (memo_key, modified_count == 0) {
+            write.note_threshold_noop(key);
+        }
+    } else {
+        write.set_cpu_dirty(mc, dest_region);
     }
 
     modified_count
+}
+
+/*
+    One row of an in-place "threshold", the operation chosen once per row instead of once per pixel.
+    Returns the pixels matched (and filled).
+*/
+fn threshold_in_place(row: &mut [Color], operation: ThresholdOperation, mask: u32, masked_threshold: u32, fill: Color, ) -> u32 {
+    #[inline(always)]
+    fn run(row: &mut [Color], mask: u32, fill: Color, hit: impl Fn(u32) -> bool) -> u32 {
+        let mut count = 0;
+        for pixel in row {
+            if hit(u32::from(*pixel) & mask) {
+                *pixel = fill;
+                count += 1;
+            }
+        }
+        count
+    }
+    let t = masked_threshold;
+    match operation {
+        ThresholdOperation::Equals => run(row, mask, fill, |v| v == t),
+        ThresholdOperation::NotEquals => run(row, mask, fill, |v| v != t),
+        ThresholdOperation::LessThan => run(row, mask, fill, |v| v < t),
+        ThresholdOperation::LessThanOrEquals => run(row, mask, fill, |v| v <= t),
+        ThresholdOperation::GreaterThan => run(row, mask, fill, |v| v > t),
+        ThresholdOperation::GreaterThanOrEquals => run(row, mask, fill, |v| v >= t),
+    }
+}
+
+static THRESHOLD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static THRESHOLD_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static THRESHOLD_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// "threshold" calls answered by the memo since the last call.
+pub fn take_threshold_memo_hits() -> u64 {
+    THRESHOLD_MEMO_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+// ("threshold" calls, of which changed nothing) since the last call.
+pub fn take_threshold_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        THRESHOLD_CALLS.swap(0, Relaxed),
+        THRESHOLD_UNCHANGED.swap(0, Relaxed),
+    )
 }
 
 pub fn scroll<'gc>(
@@ -805,11 +893,16 @@ pub fn hit_test_point(
     if target.is_point_in_bounds(test_point.0, test_point.1) {
         let x = test_point.0 as u32;
         let y = test_point.1 as u32;
-        target
-            .read_area(PixelRegion::for_pixel(x, y), renderer)
-            .get_pixel32_raw(x, y)
-            .alpha()
-            >= alpha_threshold
+
+        /*
+            If "alpha_threshold" is 0, consider it to be 1.
+
+            Backport of upstream ruffle#23870 (closes #19253):
+            with 0, a fully transparent pixel counted as a hit,
+            so the whole bounding box of a Super Smash Flash 2 platform became solid floor,
+            standing on air next to the drawn ledge.
+        */
+        target.read_area(PixelRegion::for_pixel(x, y), renderer).get_pixel32_raw(x, y).alpha() >= alpha_threshold.max(1)
     } else {
         false
     }
@@ -1335,12 +1428,15 @@ fn copy_on_cpu<'gc>(
                 // Copying an entire texture that's the same size and type? Just replace the whole thing
                 dest.raw_pixels_mut().copy_from_slice(source.raw_pixels());
             } else {
+                // Backport of upstream ruffle#24490 (copyPixels by row slices instead of per-pixel get/set, both branches of copy_on_cpu).
+                let width = dest_region.width() as usize;
                 for y in 0..dest_region.height() {
-                    for x in 0..dest_region.width() {
-                        let color = source
-                            .get_pixel32_raw(source_region.x_min + x, source_region.y_min + y);
-                        dest.set_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y, color);
-                    }
+                    let src_start =
+                        (source_region.x_min + (source_region.y_min + y) * source.width()) as usize;
+                    let dest_start =
+                        (dest_region.x_min + (dest_region.y_min + y) * dest.width()) as usize;
+                    dest.raw_pixels_mut()[dest_start..dest_start + width]
+                        .copy_from_slice(&source.raw_pixels()[src_start..src_start + width]);
                 }
             }
         } else {
@@ -1349,19 +1445,27 @@ fn copy_on_cpu<'gc>(
 
             let opaque = !dest.transparency();
 
+            let width = dest_region.width() as usize;
             for y in 0..dest_region.height() {
-                for x in 0..dest_region.width() {
-                    let mut color =
-                        source.get_pixel32_raw(source_region.x_min + x, source_region.y_min + y);
-                    if blend {
-                        color = dest
-                            .get_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y)
-                            .blend_over(&color);
+                let src_start = (source_region.x_min + (source_region.y_min + y) * source.width()) as usize;
+                let dest_start = (dest_region.x_min + (dest_region.y_min + y) * dest.width()) as usize;
+                let dest_row = &mut dest.raw_pixels_mut()[dest_start..dest_start + width];
+                let src_row = &source.raw_pixels()[src_start..src_start + width];
+                if blend {
+                    // Keep the "opaque" check inside the loop: LLVM if-converts it and vectorizes the whole body, measurably better than two split loops.
+                    for (dest, src) in dest_row.iter_mut().zip(src_row) {
+                        let mut color = dest.blend_over(src);
+                        if opaque {
+                            color = color.with_alpha(255);
+                        }
+                        *dest = color;
                     }
-                    if opaque {
-                        color = color.with_alpha(255);
+                } else {
+                    // "!blend" with a transparent dest always takes the copy branch above, so the dest is opaque here.
+                    debug_assert!(opaque);
+                    for (dest, src) in dest_row.iter_mut().zip(src_row) {
+                        *dest = src.to_un_multiplied_alpha().with_alpha(255);
                     }
-                    dest.set_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y, color);
                 }
             }
         }

@@ -64,7 +64,19 @@ impl<'gc> Stack<'gc> {
         // Ensure the StackFrame returned to the caller does not have any
         // old values on it, as these may contain Gc pointers that have already
         // been collected.
-        for value in subslice {
+
+        /*
+            With fast calls, only the locals.
+            The operand stack part is always written before it is read (the verifier rejects any pop without a push of the same frame, errors #1023/#1024),
+            and nothing traces this stack (see "Collect for StackData"),
+            so stale values above the locals are never seen.
+        */
+        let clear = if crate::avm2::activation::fast_calls() {
+            body.num_locals as usize
+        } else {
+            frame_size
+        };
+        for value in &subslice[..clear] {
             value.set(Value::Undefined);
         }
 
@@ -134,6 +146,12 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
     #[inline(always)]
     pub fn stack_top(&self) -> &'a Cell<Value<'gc>> {
         &self.data[self.stack_pointer.get() - 1]
+    }
+
+    // Address of local 0 of this frame, for the JIT (a "Cell<Value>" has the layout of a "Value").
+    #[inline(always)]
+    pub fn base_ptr(&self) -> *mut Value<'gc> {
+        self.data.as_ptr() as *mut Value<'gc>
     }
 
     #[inline(always)]

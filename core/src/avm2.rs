@@ -373,6 +373,12 @@ impl<'gc> Avm2<'gc> {
     ///
     /// Attempts to register the same listener for the same event will also do
     /// nothing.
+	
+    /// Entries in all broadcast lists (census: line).
+    pub fn broadcast_len(&self) -> usize {
+        self.broadcast_list.values().map(|v| v.len()).sum()
+    }
+
     pub fn register_broadcast_listener(
         context: &mut UpdateContext<'gc>,
         object: Object<'gc>,

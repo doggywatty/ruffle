@@ -184,7 +184,12 @@ pub struct UpdateContext<'gc> {
 
     /// The maximum amount of time that can be called before a `Error::ExecutionTimeout`
     /// is raised. This defaults to 15 seconds but can be changed.
-    pub max_execution_duration: Duration,
+
+    /*
+        A reference to the Player's value rather than a copy, so a "ScriptLimits" tag met while preloading raises it for good,
+        not just for the update that read the tag.
+    */
+    pub max_execution_duration: &'gc mut Duration,
 
     /// A tracker for the current keyboard focused element
     pub focus_tracker: FocusTracker<'gc>,

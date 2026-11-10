@@ -198,14 +198,7 @@ package flash.display {
             alphaMultiplier:uint
         ):void;
 
-        public function generateFilterRect(sourceRect:Rectangle, filter:BitmapFilter):Rectangle {
-            // Flash always reports that a ShaderFilter affects the entire BitmapData, ignoring sourceRect.
-            if (filter is ShaderFilter) {
-                return this.rect.clone();
-            }
-            stub_method("flash.display.BitmapData", "generateFilterRect");
-            return sourceRect.clone();
-        }
+        public native function generateFilterRect(sourceRect:Rectangle, filter:BitmapFilter):Rectangle;
 
         [API("680")]
         public function encode(rect:Rectangle, compressor:Object, byteArray:ByteArray = null):ByteArray {

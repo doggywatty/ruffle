@@ -288,7 +288,8 @@ pub struct Push<'a> {
     pub values: Vec<Value<'a>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+// "Copy" (every variant is) for "Reader::flashnx_read_push".
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value<'a> {
     Undefined,
     Null,

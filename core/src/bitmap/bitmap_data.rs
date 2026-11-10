@@ -15,6 +15,135 @@ use std::ops::Range;
 use swf::{Rectangle, Twips};
 use tracing::instrument;
 
+/*
+    CPU BitmapData memory accounting
+
+    Ruffle keeps every BitmapData's pixels in a CPU-side Vec.
+    A cutscene-heavy game can allocate hundreds of large surfaces and OOM-abort the whole process.
+    We track live bytes here so the AVM1 constructor can refuse new surfaces past a budget
+    (returning "undefined, which AS2 code handles) instead of letting the process OOM-abort.
+    Live, not cumulative: "MemGuard" subtracts on drop, including on GC sweep.
+*/
+static BITMAPDATA_LIVE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Ceiling for live CPU BitmapData bytes.
+pub const BITMAPDATA_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
+
+// Live CPU bytes currently held by BitmapData pixel buffers.
+pub fn bitmapdata_live_bytes() -> u64 {
+    BITMAPDATA_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/*
+    Only surfaces at least this big are ever refused.
+
+    This floor is load bearing (see "BITMAPDATA_BUDGET_BYTES"):
+    it MUST sit ABOVE the blit engine's working buffers, or refusing one freezes the game.
+    
+    Super Bowser World's screen buffer is 640x480 (~1.2 MB) and its ground strips are 1280x240 (~1.2 MB):
+    a 1 MB floor caught those, refused them, and froze the engine into per-frame re-render (the 2 s freeze regression).
+    
+    At 4 MB only the genuine 1824x1174 (~8.5 MB) "monsters" are refused - bounding the cutscene CPU flood without ever touching a working buffer.
+    Ground-strip memory is bounded on the GPU side instead (`DroppedBitmap`), which never freezes because it keeps a valid handle and Ruffle's CPU pixels stay intact for collision.
+*/
+const BITMAPDATA_LARGE_SURFACE_BYTES: u64 = 4 * 1024 * 1024;
+
+/*
+    True when allocating a "width x height" BitmapData now would push live CPU bytes past ["BITMAPDATA_BUDGET_BYTES"]
+    but only for individually large surfaces (see ["BITMAPDATA_LARGE_SURFACE_BYTES"]).
+    The AVM1 constructor uses this to degrade gracefully (return "undefined") instead of OOM-aborting.
+*/
+pub fn bitmapdata_would_exceed_budget(width: u32, height: u32) -> bool {
+    if BITMAPDATA_BUDGET_BYTES == 0 {
+        return false;
+    }
+    let want = width as u64 * height as u64 * 4;
+    // Never refuse a small surface - it can't be the OOM culprit, and refusing
+    // one risks breaking a game that needs it.
+    if want < BITMAPDATA_LARGE_SURFACE_BYTES {
+        return false;
+    }
+    BITMAPDATA_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed).saturating_add(want) > BITMAPDATA_BUDGET_BYTES
+}
+
+/*
+    True when live CPU BitmapData bytes are high enough that the incremental GC is likely to fall behind the allocation rate.
+
+    New Super Bowser World allocates ~1.2 MB ground strips in bursts and drops them again, so they ARE collectable
+    but "collect_debt()" only pays the incremental debt each frame, and hardware traces show the live total sawtoothing upward (259 -> 329 -> 349 -> 398 MB) until the heap refuses a 640x480 screen buffer.
+    Those strips are 1.2 MB, i.e. BELOW "BITMAPDATA_LARGE_SURFACE_BYTES", so the refusal guard can never catch them
+    and it must not, since the screen buffer it would also catch is exactly the same size.
+    Forcing a full cycle when pressure is high flattens the peaks instead of refusing anything.
+*/
+pub fn bitmapdata_under_pressure() -> bool {
+    if BITMAPDATA_BUDGET_BYTES == 0 {
+        return false;
+    }
+    BITMAPDATA_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) > BITMAPDATA_BUDGET_BYTES / 2
+}
+
+/*
+    Zero-cost lifetime guard for a `BitmapRawData`'s pixel allocation: adds its
+    byte size to the live counter on creation and subtracts it on drop (including
+    GC sweep, since it lives as a plain field of the gc-managed `BitmapRawData`).
+    `BitmapRawData` is `#[collect(no_drop)]` - that only forbids a Drop on the
+    struct itself; a field owning a Drop type (like the `Vec` already does) is
+    fine.
+*/
+struct MemGuard(u64);
+
+/*
+    The decoded pixels of a library bitmap, shared by every BitmapData made from it until one of them changes a pixel:
+    Flash Player 10.1's "BitmapData single reference"
+    (Adobe: "When multiple instances of the same image are created, a single version of the bitmap is used for all BitmapData instances",
+    and a method that modifies pixels gives that instance its own copy).
+    
+    Upstream decoded and copied the image for every instance,
+    so a library bitmap placed by a goto was inflated again each time:
+    ~9 % of a 14-second Super Smash Flash 2 loading frame.
+
+    Counted once in "BITMAPDATA_LIVE_BYTES". See "BitmapCharacter::shared_pixels".
+*/
+pub struct SharedPixels {
+    width: u32,
+    height: u32,
+    colors: Box<[Color]>,
+    _mem: MemGuard,
+}
+
+impl SharedPixels {
+    pub fn new(width: u32, height: u32, colors: Vec<Color>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            width,
+            height,
+            _mem: MemGuard::new(colors.len() as u64 * 4),
+            colors: colors.into_boxed_slice(),
+        })
+    }
+}
+
+impl std::fmt::Debug for SharedPixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedPixels({}x{})", self.width, self.height)
+    }
+}
+impl MemGuard {
+    fn new(bytes: u64) -> Self {
+        BITMAPDATA_LIVE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        MemGuard(bytes)
+    }
+}
+impl Drop for MemGuard {
+    fn drop(&mut self) {
+        BITMAPDATA_LIVE_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl std::fmt::Debug for MemGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemGuard({})", self.0)
+    }
+}
+
 /// An implementation of the Lehmer/Park-Miller random number generator
 /// Uses the fixed parameters m = 2,147,483,647 and a = 16,807
 pub struct LehmerRng {
@@ -251,6 +380,14 @@ impl<'gc> BitmapData<'gc> {
         Self(data)
     }
 
+    // A transparent BitmapData on a library bitmap's shared pixels (SharedPixels).
+    pub fn new_with_shared_pixels(mc: &Mutation<'gc>, shared: std::sync::Arc<SharedPixels>) -> Self {
+        let mut data =
+            BitmapRawData::new_with_pixels(shared.width, shared.height, true, Vec::new());
+        data.shared = Some(shared);
+        Self(BitmapRawDataWrapper::new(Gc::new(mc, data.into())))
+    }
+
     pub fn dummy(mc: &Mutation<'gc>) -> Self {
         Self(BitmapRawDataWrapper::dummy(mc))
     }
@@ -365,9 +502,17 @@ impl<'gc> BitmapData<'gc> {
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct BitmapRawData<'gc> {
-    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
+    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values (empty while "shared" holds them).
     #[collect(require_static)]
     pixels: Vec<Color>,
+
+    // The pixels of the library bitmap this was made from, until a pixel changes (SharedPixels, unshare).
+    #[collect(require_static)]
+    shared: Option<std::sync::Arc<SharedPixels>>,
+
+    /// Keeps "BITMAPDATA_LIVE_BYTES" in step with "pixels" for this instance.
+    #[collect(require_static)]
+    _mem: MemGuard,
 
     width: u32,
     height: u32,
@@ -397,12 +542,45 @@ pub struct BitmapRawData<'gc> {
     #[collect(require_static)]
     dirty_state: DirtyState,
 
+    // Bumped by every access that may change a pixel (CPU writes, GPU-side draws, dispose), so an operation can tell that the bitmap is exactly as it left it (see "ThresholdMemo")
+    #[collect(require_static)]
+    generation: u64,
+
+    // "threshold" calls on this bitmap that changed nothing, as of "generation" (see "bitmap::operations::threshold"), allocated on the first such call only.
+    #[collect(require_static)]
+    threshold_memo: Option<Box<ThresholdMemo>>,
+
     /// Holds an egui texture handle, used for rendering this Bitmap in the debug ui.
     /// This is automatically set to `None` when the texture is updated (either from
     /// marking the CPU side dirty, or from performing a GPU -> CPU sync).
     #[cfg(feature = "egui")]
     pub egui_texture: std::cell::RefCell<Option<egui::TextureHandle>>,
 }
+
+// Arguments of a "threshold" of a bitmap onto itself that matched no pixel, all of them: the same call on the same pixels matches none again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ThresholdKey {
+    pub src_rect: (i32, i32, i32, i32),
+    pub dest_point: (i32, i32),
+    pub operation: u8,
+    pub threshold: u32,
+    pub colour: u32,
+    pub mask: u32,
+    pub copy_source: bool,
+}
+
+/*
+    The ThresholdKeys known to change nothing at "generation".
+    Super Smash Flash 2 recolours every fighter pose each frame with one "threshold" per palette colour:
+    93 % of 157 000 calls in 300 frames changed nothing, each one scanning the whole bitmap.
+*/
+pub struct ThresholdMemo {
+    generation: u64,
+    keys: Vec<ThresholdKey>,
+}
+
+// Enough for a palette: past it the memo simply stops learning.
+const THRESHOLD_MEMO_KEYS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum DirtyState {
@@ -428,7 +606,7 @@ mod wrapper {
     use ruffle_render::commands::CommandHandler;
     use std::cell::Ref;
 
-    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
+    use super::{BitmapRawData, DirtyState, MemGuard, copy_pixels_to_bitmapdata};
 
     /// A wrapper type that ensures that we always wait for a pending
     /// GPU -> CPU sync to complete (using `sync_handle`) before accessing
@@ -476,6 +654,7 @@ mod wrapper {
                 mc,
                 BitmapRawData {
                     pixels: Vec::new(),
+                    _mem: MemGuard::new(0),
                     width: 0,
                     height: 0,
                     transparency: false,
@@ -484,6 +663,9 @@ mod wrapper {
                     avm2_object: None,
                     display_objects: vec![],
                     dirty_state: DirtyState::Clean,
+                    generation: 0,
+                    threshold_memo: None,
+                    shared: None,
                     #[cfg(feature = "egui")]
                     egui_texture: Default::default(),
                 }
@@ -499,6 +681,7 @@ mod wrapper {
             let data = self.sync(renderer).borrow();
             BitmapRawData {
                 pixels: data.pixels.clone(),
+                _mem: MemGuard::new((data.pixels.len() * 4) as u64),
                 width: data.width,
                 height: data.height,
                 transparency: data.transparency,
@@ -508,6 +691,9 @@ mod wrapper {
                 display_objects: vec![],
                 // We have no GPU texture, so there's no need to mark as dirty
                 dirty_state: DirtyState::Clean,
+                generation: 0,
+                threshold_memo: None,
+                shared: data.shared.clone(),
                 #[cfg(feature = "egui")]
                 egui_texture: Default::default(),
             }
@@ -734,6 +920,7 @@ impl<'gc> BitmapRawData<'gc> {
                 Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
                 width as usize * height as usize
             ],
+            _mem: MemGuard::new(width as u64 * height as u64 * 4),
             width,
             height,
             transparency,
@@ -742,6 +929,9 @@ impl<'gc> BitmapRawData<'gc> {
             avm2_object: None,
             display_objects: vec![],
             dirty_state: DirtyState::Clean,
+            generation: 0,
+            threshold_memo: None,
+            shared: None,
             #[cfg(feature = "egui")]
             egui_texture: Default::default(),
         }
@@ -754,6 +944,7 @@ impl<'gc> BitmapRawData<'gc> {
         pixels: Vec<Color>,
     ) -> Self {
         Self {
+            _mem: MemGuard::new(pixels.len() as u64 * 4),
             pixels,
             width,
             height,
@@ -762,6 +953,9 @@ impl<'gc> BitmapRawData<'gc> {
             avm2_object: None,
             disposed: false,
             dirty_state: DirtyState::Clean,
+            generation: 0,
+            threshold_memo: None,
+            shared: None,
             display_objects: vec![],
             #[cfg(feature = "egui")]
             egui_texture: Default::default(),
@@ -773,9 +967,12 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     pub fn dispose(&mut self) {
+        self.generation += 1;
         self.width = 0;
         self.height = 0;
         self.pixels = Vec::new(); // free the CPU pixel buffer
+        self.shared = None;
+        self._mem = MemGuard::new(0); // release its bytes from the live counter now
         self.bitmap_handle = None;
         // There's no longer a handle to update
         self.dirty_state = DirtyState::Clean;
@@ -823,11 +1020,13 @@ impl<'gc> BitmapRawData<'gc> {
         sync_handle: Box<dyn SyncHandle>,
         region: PixelRegion,
     ) {
+        self.generation += 1;
         self.dirty_state = DirtyState::GpuModified(sync_handle, region);
         self.inform_display_objects(gc_context);
     }
 
     pub fn set_cpu_dirty(&mut self, gc_context: &Mutation<'gc>, region: PixelRegion) {
+        self.generation += 1;
         debug_assert!(region.x_max <= self.width);
         debug_assert!(region.y_max <= self.height);
 
@@ -853,11 +1052,32 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     pub fn pixels(&self) -> &[Color] {
-        &self.pixels
+        self.colors()
     }
 
     pub fn pixels_rgba(&self) -> &[u8] {
-        Color::slice_as_rgba(&self.pixels)
+        Color::slice_as_rgba(self.colors())
+    }
+
+    // The pixels, shared (SharedPixels) or not.
+    #[inline]
+    fn colors(&self) -> &[Color] {
+        match &self.shared {
+            Some(shared) => &shared.colors,
+            None => &self.pixels,
+        }
+    }
+
+    /*
+        A pixel is about to change: the shared pixels become this bitmap's own copy first.
+        Every writer below goes through here.
+    */
+    #[inline]
+    fn unshare(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            self.pixels = shared.colors.to_vec();
+            self._mem = MemGuard::new(self.pixels.len() as u64 * 4);
+        }
     }
 
     pub fn width(&self) -> u32 {
@@ -873,11 +1093,15 @@ impl<'gc> BitmapRawData<'gc> {
 
     #[inline]
     pub fn set_pixel32_raw(&mut self, x: u32, y: u32, color: Color) {
+        self.generation += 1;
+        self.unshare();
         self.pixels[(x + y * self.width) as usize] = color;
     }
 
     #[inline]
     pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
+        self.generation += 1;
+        self.unshare();
         let p1 = (x1 + y * self.width) as usize;
         let p2 = (x2 + y * self.width) as usize;
         let slice = &mut self.pixels[p1..p2];
@@ -886,20 +1110,57 @@ impl<'gc> BitmapRawData<'gc> {
 
     #[inline]
     pub fn fill(&mut self, color: Color) {
+        self.generation += 1;
+        self.unshare();
         self.pixels.fill(color);
     }
 
     #[inline]
     pub fn get_pixel32_raw(&self, x: u32, y: u32) -> Color {
-        self.pixels[(x + y * self.width()) as usize]
+        self.colors()[(x + y * self.width()) as usize]
     }
 
     pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
+        self.generation += 1;
+        self.unshare();
         &mut self.pixels
     }
 
+    // see "generation".
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    // Put back the generation an operation read before taking "raw_pixels_mut", once it has checked that it changed no pixel.
+    pub fn restore_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    // Whether this exact "threshold" already changed nothing on these very pixels.
+    pub fn threshold_known_noop(&self, key: &ThresholdKey) -> bool {
+        self.threshold_memo.as_ref().is_some_and(|m| m.generation == self.generation && m.keys.contains(key))
+    }
+
+    // Remember that "key" changed nothing at the current generation.
+    pub fn note_threshold_noop(&mut self, key: ThresholdKey) {
+        let generation = self.generation;
+        let memo = self.threshold_memo.get_or_insert_with(|| {
+            Box::new(ThresholdMemo {
+                generation,
+                keys: Vec::new(),
+            })
+        });
+        if memo.generation != generation {
+            memo.generation = generation;
+            memo.keys.clear();
+        }
+        if memo.keys.len() < THRESHOLD_MEMO_KEYS && !memo.keys.contains(&key) {
+            memo.keys.push(key);
+        }
+    }
+
     pub fn raw_pixels(&self) -> &[Color] {
-        &self.pixels
+        self.colors()
     }
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`

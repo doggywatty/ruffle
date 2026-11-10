@@ -94,6 +94,18 @@ pub trait RenderBackend: Any {
     ) -> Result<BitmapHandle, Error>;
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error>;
+
+    /*
+        Register an image that never changes and that "reload" can decode again at any time (a SWF bitmap tag).
+        A backend may then drop the texture of an image nothing has drawn for a while and rebuild it on the next draw.
+        
+        The default keeps it for ever, like "register_bitmap".
+    */
+    fn register_bitmap_reloadable(&mut self, bitmap: Bitmap<'_>, reload: Rc<dyn Fn() -> Option<Bitmap<'static>>>, ) -> Result<BitmapHandle, Error> {
+        let _ = reload;
+        self.register_bitmap(bitmap)
+    }
+
     fn update_texture(
         &mut self,
         handle: &BitmapHandle,

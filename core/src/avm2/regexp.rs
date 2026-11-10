@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::num::NonZero;
+use std::sync::{Arc, Mutex};
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
@@ -26,9 +27,64 @@ pub struct RegExp<'gc> {
     flags: RegExpFlags,
     last_index: usize,
 
+    // Shared with every RegExp of the same pattern ("compile_shared").
     #[collect(require_static)]
-    cached_regex: Option<Result<regress::Regex, ()>>,
+    cached_regex: Option<Result<Arc<regress::Regex>, ()>>,
     cached_text: Option<CachedText<'gc>>,
+}
+
+/*
+    Compiled patterns, by source and the flags that change the compilation ("g" does not).
+
+    A regex literal builds a new RegExp every time it is evaluated,
+    and each one compiled its pattern again on first use.
+    
+    Super Smash Flash 2 tests every object of a stage against a dozen literals while it loads the stage ("StageData"):
+    in a 14-second loading frame, ~21 % of the time went to compiling the same few patterns,
+    and every discarded RegExp kept its program alive until the collector ran,
+    which it cannot do in the middle of a script.
+    
+    A compiled pattern never changes, so one copy serves them all.
+    Bounded: patterns built from data ("new RegExp(s)") can be endless, so the cache starts over past "MAX".
+*/
+fn compile_shared(source: &str, flags: RegExpFlags) -> Result<Arc<regress::Regex>, ()> {
+    type Cache = fnv::FnvHashMap<u8, fnv::FnvHashMap<Box<str>, Result<Arc<regress::Regex>, ()>>>;
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    const MAX: usize = 512;
+
+    let key_flags = (flags - RegExpFlags::GLOBAL).bits();
+    let compile = || {
+        regress::Regex::with_flags(
+            source,
+            regress::Flags {
+                icase: flags.contains(RegExpFlags::IGNORE_CASE),
+                multiline: flags.contains(RegExpFlags::MULTILINE),
+                dot_all: flags.contains(RegExpFlags::DOTALL),
+                extended: flags.contains(RegExpFlags::EXTENDED),
+                no_opt: false,
+                unicode: false,
+                unicode_sets: false,
+            },
+        )
+        .map(Arc::new)
+        .map_err(drop)
+    };
+    let Ok(mut guard) = CACHE.lock() else {
+        return compile();
+    };
+    let cache = guard.get_or_insert_with(Default::default);
+    if let Some(hit) = cache.get(&key_flags).and_then(|by_source| by_source.get(source)) {
+        return hit.clone();
+    }
+    let compiled = compile();
+    if cache.values().map(|by_source| by_source.len()).sum::<usize>() >= MAX {
+        cache.clear();
+    }
+    cache
+        .entry(key_flags)
+        .or_default()
+        .insert(Box::from(source), compiled.clone());
+    compiled
 }
 
 impl Clone for RegExp<'_> {
@@ -96,19 +152,7 @@ impl<'gc> RegExp<'gc> {
         F: FnOnce(&mut CachedText<'gc>, regress::Match) -> T,
     {
         if self.cached_regex.is_none() {
-            let re = regress::Regex::with_flags(
-                &self.source.to_utf8_lossy(),
-                regress::Flags {
-                    icase: self.flags.contains(RegExpFlags::IGNORE_CASE),
-                    multiline: self.flags.contains(RegExpFlags::MULTILINE),
-                    dot_all: self.flags.contains(RegExpFlags::DOTALL),
-                    extended: self.flags.contains(RegExpFlags::EXTENDED),
-                    no_opt: false,
-                    unicode: false,
-                    unicode_sets: false,
-                },
-            );
-            self.cached_regex = Some(re.map_err(drop));
+            self.cached_regex = Some(compile_shared(&self.source.to_utf8_lossy(), self.flags));
         }
 
         let regex = match self.cached_regex.as_mut() {

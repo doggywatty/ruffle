@@ -8,7 +8,7 @@ use crate::avm2::error::{
     make_error_2027,
 };
 use crate::avm2::filters::FilterAvm2Ext;
-use crate::avm2::globals::flash::display::display_object::object_to_rectangle;
+use crate::avm2::globals::flash::display::display_object::{new_rectangle, object_to_rectangle};
 use crate::avm2::globals::flash::geom::transform::object_to_color_transform;
 use crate::avm2::globals::flash::geom::transform::object_to_matrix;
 use crate::avm2::globals::slots::{
@@ -23,7 +23,7 @@ use crate::avm2_stub_method;
 use crate::bitmap::bitmap_data::{BitmapData, ChannelOptions, ThresholdOperation};
 use crate::bitmap::bitmap_data::{BitmapDataDrawError, IBitmapDrawable};
 use crate::bitmap::{is_size_valid, operations};
-use crate::character::{Character, CompressedBitmap};
+use crate::character::Character;
 use crate::ecma_conversions::round_to_even;
 use crate::swf::BlendMode;
 use ruffle_render::filters::Filter;
@@ -71,19 +71,10 @@ fn get_rectangle_x_y_width_height<'gc>(
 /// class named by `name`.
 pub fn fill_bitmap_data_from_symbol<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    bd: &CompressedBitmap,
+    bitmap: &crate::character::BitmapCharacter<'gc>,
 ) -> BitmapData<'gc> {
-    let bitmap = bd.decode().expect("Failed to decode BitmapData");
-    BitmapData::new_with_pixels(
-        activation.context.gc_context,
-        bitmap.width(),
-        bitmap.height(),
-        true,
-        bitmap
-            .as_colors()
-            .map(crate::bitmap::bitmap_data::Color::from)
-            .collect(),
-    )
+    // The symbol's decoded pixels, shared until a pixel changes (SharedPixels), instead of a fresh decode and copy per instance.
+    BitmapData::new_with_shared_pixels(activation.context.gc_context, bitmap.shared_pixels())
 }
 
 /// Implements `flash.display.BitmapData`'s 'init' method (invoked from the AS3 constructor)
@@ -113,7 +104,7 @@ pub fn init<'gc>(
 
     let new_bitmap_data = if let Some(Character::Bitmap(bitmap)) = character {
         // Instantiating BitmapData from an Animate-style bitmap asset
-        fill_bitmap_data_from_symbol(activation, bitmap.compressed())
+        fill_bitmap_data_from_symbol(activation, &bitmap)
     } else {
         if character.is_some() {
             //TODO: Determine if mismatched symbols will still work as a
@@ -1121,6 +1112,36 @@ pub fn get_rect<'gc>(
             ],
         );
     }
+    Ok(Value::Undefined)
+}
+
+/*
+	Implement "BitmapData.generateFilterRect": the rectangle "filter" expands "sourceRect" to.
+	Games that pre-render filtered bitmaps (e.g. Disney's DIG "BitmapMovieClip" shell) size their buffers from this:
+	the old stub returned "sourceRect" unchanged, clipping blurred/glowing sprites.
+*/
+pub fn generate_filter_rect<'gc>(activation: &mut Activation<'_, 'gc>, this: Value<'gc>, args: &[Value<'gc>], ) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    if let Some(bitmap_data) = this.as_bitmap_data() {
+        let source_rect = object_to_rectangle(args.get_object(activation, 0, "sourceRect")?);
+        let filter_obj = args.get_object(activation, 1, "filter")?;
+        let filter = Filter::from_avm2_object(activation, filter_obj)?;
+
+        // Flash reports a ShaderFilter as affecting the entire BitmapData.
+        let dest = if matches!(filter, Filter::ShaderFilter(_)) {
+            Rectangle {
+                x_min: Twips::ZERO,
+                x_max: Twips::from_pixels(bitmap_data.width() as f64),
+                y_min: Twips::ZERO,
+                y_max: Twips::from_pixels(bitmap_data.height() as f64),
+            }
+        } else {
+            filter.calculate_dest_rect(source_rect)
+        };
+        return new_rectangle(activation, dest);
+    }
+
     Ok(Value::Undefined)
 }
 

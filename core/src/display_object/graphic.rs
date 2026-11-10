@@ -47,21 +47,36 @@ pub struct GraphicData<'gc> {
 }
 
 impl<'gc> Graphic<'gc> {
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared.get())
+    }
+
     /// Construct a `Graphic` from it's associated `Shape` tag.
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,
         swf_shape: swf::Shape,
         movie: Arc<SwfMovie>,
     ) -> Self {
-        let library = context.library.library_for_movie(movie.clone()).unwrap();
+        /*
+            The shape is registered with the renderer the first time it is drawn, not here.
+            
+            Upstream tessellates every DefineShape while the movie preloads,
+            which decodes every bitmap the fills use and uploads it:
+            Super Smash Flash 2 had 79 of its 81 atlases (1 049 MB) holding images never shown once,
+            and still 553 MB after a whole fight, on a console where that memory is what runs out.
+            Morph shapes, glyphs and drawings are already registered on first use.
+        */
+        let render_handle = OnceCell::new();
+        if !LAZY_SHAPES.load(std::sync::atomic::Ordering::Relaxed) {
+            // FlashNX `lazyshape.off`: register now, as upstream does.
+            let library = context.library.library_for_movie(movie.clone()).unwrap();
+            let _ = render_handle.set(Some(context.renderer.register_shape((&swf_shape).into(), &MovieLibrarySource { library }), ));
+        }
         let shared = GraphicShared {
             id: swf_shape.id,
             bounds: swf_shape.shape_bounds,
-            render_handle: Some(
-                context
-                    .renderer
-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
-            ),
+            render_handle,
             shape: swf_shape,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
@@ -84,7 +99,7 @@ impl<'gc> Graphic<'gc> {
         let shared = GraphicShared {
             id: 0,
             bounds: Default::default(),
-            render_handle: None,
+            render_handle: OnceCell::from(None),
             shape: swf::Shape {
                 version: 32,
                 id: 0,
@@ -171,6 +186,24 @@ impl<'gc> Graphic<'gc> {
     }
 }
 
+// Register static shapes on first draw (default), or while the movie preloads as upstream does ("lazyshape.off" marker, to compare).
+static LAZY_SHAPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_lazy_shapes(enabled: bool) {
+    LAZY_SHAPES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl<'gc> Graphic<'gc> {
+    // The shape's renderer handle, registering it on the first call.
+    fn base_handle(self, context: &mut RenderContext) -> Option<ShapeHandle> {
+        let shared = self.0.shared.get();
+        shared.render_handle.get_or_init(|| {
+            let library = context.library.library_for_movie(shared.movie.clone())?;
+            Some(context.renderer.register_shape((&shared.shape).into(), &MovieLibrarySource { library }), )
+        }).clone()
+    }
+}
+
 impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
     fn base(self) -> Gc<'gc, DisplayObjectBase<'gc>> {
         HasPrefixField::as_prefix_gc(self.0)
@@ -249,7 +282,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
-        } else if let Some(base_handle) = self.0.shared.get().render_handle.clone() {
+        } else if let Some(base_handle) = self.base_handle(context) {
             let transform = context.transform_stack.transform();
 
             // Calculate the current scale from the transform, to determine if
@@ -332,7 +365,11 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 struct GraphicShared {
     id: CharacterId,
     shape: swf::Shape,
-    render_handle: Option<ShapeHandle>,
+    /*
+        Registered on first draw (see "Graphic::base_handle");
+        "None" inside when there is nothing to register (an empty Graphic, or no library).
+    */
+    render_handle: OnceCell<Option<ShapeHandle>>,
     bounds: Rectangle<Twips>,
     movie: Arc<SwfMovie>,
     #[collect(require_static)]

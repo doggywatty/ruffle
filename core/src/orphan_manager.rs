@@ -18,6 +18,23 @@ use std::rc::Rc;
 #[collect(no_drop)]
 pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
+    /*
+        The same orphans by address, each with the order it was pushed in,
+        so the dirty ones queued by address ("display_object::queue_dirty_orphan")
+        can be found and processed in list order without iterating the list. Kept in step with "orphans".
+    */
+    index: fnv::FnvHashMap<usize, (u64, DisplayObjectWeak<'gc>)>,
+    #[collect(require_static)]
+    next_seq: u64,
+
+    /*
+        An orphan that only a frame-end cleanup removes(one a RemoveObject tag orphaned, see "cleanup_dead_orphans")
+        was added since the last cleanup.
+
+        Without one, the cleanup an inner goto runs has nothing to remove and is skipped (it iterated the whole list).
+    */
+    #[collect(require_static)]
+    needs_cleanup: bool,
 }
 
 impl<'gc> OrphanManager<'gc> {
@@ -30,16 +47,48 @@ impl<'gc> OrphanManager<'gc> {
     /// multiple SWFS rely on this behavior, so we need to match Flash's
     /// behavior. This should not be called manually - `movie_clip` will
     /// call it when necessary.
+    
+    /// Orphans currently listed, dead or alive (`census:` line).
+    pub fn len(&self) -> usize {
+        self.orphans.len()
+    }
+
     pub fn add_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
+        // A new (or returning) orphan is processed by the next inner goto at least once.
+        dobj.base().set_lifecycle_dirty(true);
+        crate::display_object::bump_orphan_mark_epoch();
         // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
         // so the pointers can't overlap by accident.
-        if self
-            .orphans
-            .iter()
-            .all(|d| !std::ptr::eq(d.as_ptr(), dobj.as_ptr()))
-        {
+        
+        // By the address index instead of a scan of the whole list (this ran on every removal from a display list).
+        let addr = dobj.as_ptr() as usize;
+        if !self.index.contains_key(&addr) {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.index.insert(addr, (seq, dobj.downgrade()));
             self.orphans_mut().push(dobj.downgrade());
         }
+        if !dobj.placed_by_avm2_script() {
+            self.needs_cleanup = true;
+        }
+        crate::display_object::queue_dirty_orphan(dobj);
+    }
+
+    // The queued addresses that are listed orphans, still valid and still dirty, with their list order, sorted by it.
+    pub fn resolve_dirty(
+        &self,
+        mc: &Mutation<'gc>,
+        addrs: &[usize],
+    ) -> Vec<(u64, DisplayObject<'gc>)> {
+        let mut out: Vec<(u64, DisplayObject<'gc>)> = addrs
+            .iter()
+            .filter_map(|a| self.index.get(a))
+            .filter_map(|(seq, weak)| valid_orphan(*weak, mc).map(|d| (*seq, d)))
+            .filter(|(_, d)| d.base().lifecycle_dirty())
+            .collect();
+        out.sort_unstable_by_key(|e| e.0);
+        out.dedup_by_key(|e| e.0);
+        out
     }
 
     pub fn each_orphan_obj(
@@ -62,8 +111,29 @@ impl<'gc> OrphanManager<'gc> {
     /// Called at the end of `run_all_phases_avm2` - removes any movies
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
+
+    // Whether a cleanup could remove anything an inner goto must not see again (see "needs_cleanup").
+    pub fn needs_cleanup(&self) -> bool {
+        self.needs_cleanup
+    }
+
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
-        self.orphans_mut().retain(|d| {
+        self.needs_cleanup = false;
+        let mut removed: Vec<usize> = Vec::new();
+        Rc::make_mut(&mut self.orphans).retain(|d| {
+            let keep = Self::keep_orphan(d, mc);
+            if !keep {
+                removed.push(d.as_ptr() as usize);
+            }
+            keep
+        });
+        for addr in removed {
+            self.index.remove(&addr);
+        }
+    }
+
+    fn keep_orphan(d: &DisplayObjectWeak<'gc>, mc: &Mutation<'gc>) -> bool {
+        {
             if let Some(dobj) = valid_orphan(*d, mc) {
                 // All clips that become orphaned (have their parent removed, or start out with no parent)
                 // get added to the orphan list. However, there's a distinction between clips
@@ -89,7 +159,7 @@ impl<'gc> OrphanManager<'gc> {
             } else {
                 false
             }
-        });
+        }
     }
 }
 
@@ -97,6 +167,9 @@ impl<'gc> Default for OrphanManager<'gc> {
     fn default() -> Self {
         Self {
             orphans: Rc::new(Vec::new()),
+            index: Default::default(),
+            next_seq: 0,
+            needs_cleanup: false,
         }
     }
 }

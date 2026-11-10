@@ -94,6 +94,19 @@ default_compatibility_rules = []
 egui = ["dep:egui", "dep:egui_extras", "png"]
 jpegxr = ["dep:jpegxr", "lzma"]
 default_font = []
+
+# Per-action AVM1 timing for the Switch measurement build only.
+flashnx_instr = []
+
+# Live-object census per AVM2 class (census: line), costs a lock on very AVM2 object created and freed, so it is NOT part of flashnx_instr
+flashnx_census = []
+
+# AVM2 opcode census (avm2ops: lines), costs ~14 % of an AS3-bound frame (a 256 KB pair table), so it is also NOT part of flashnx_instr
+flashnx_opcount = []
+
+# Baseline JIT for AVM2 bytecode (src/avm2/activation_jit.rs), needs AArch64 and cpp/src/flashnx_jit.c: Switch build only.
+flashnx_jit = []
+
 serde = ["serde/derive"]
 
 [build-dependencies]

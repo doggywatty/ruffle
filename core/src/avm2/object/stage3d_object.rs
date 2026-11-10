@@ -62,7 +62,20 @@ impl<'gc> Stage3DObject<'gc> {
                 Ok(context3d) => context3d,
                 Err(err) => {
                     tracing::error!("Failed to create Context3d: {}", err);
-                    // TODO the docs say FP dispatches an "error" event here
+                    /*
+                        Local patch: for upstream's TODO right here:
+                        
+                        Flash Player dispatches an ErrorEvent when a context cannot be made, and returning in silence has two costs on a renderer without Stage3D (ours, and upstream's own webgl and canvas backends).
+                        The movie never learns that 3D is unavailable, so a game with a 2D fallback never takes it and simply waits for ever:
+                        and the status stays "Requested", so this runs again on EVERY frame, failing and logging each time.
+                        Clearing the status stops the retry loop, and the event gives the movie the one chance it has to react.
+                    */
+                    self.clear_context3d(context.gc());
+                    let event = {
+                        let mut activation = crate::avm2::Activation::from_nothing(context);
+                        EventObject::error_event(&mut activation, "Context3D is not available", 3702, )
+                    };
+                    Avm2::dispatch_event(context, event, self.into());
                     return;
                 }
             };

@@ -51,6 +51,22 @@ pub fn get_version<'gc>(
     .into())
 }
 
+/*
+    Report "Capabilities.playerType" as "PlugIn" instead of Ruffle's default.
+    Off unless the host turns it on for a specific game, see the note in "get_player_type".
+*/
+static PLUGIN_PLAYER_TYPE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// Set by the host before building the player, per game.
+pub fn set_plugin_player_type(on: bool) {
+    PLUGIN_PLAYER_TYPE.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn plugin_player_type() -> bool {
+    PLUGIN_PLAYER_TYPE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Implements `flash.system.Capabilities.playerType`
 pub fn get_player_type<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -58,7 +74,22 @@ pub fn get_player_type<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     // TODO: When should "External" be returned?
-    let player_type = if cfg!(target_family = "wasm") {
+
+    /*
+        Disney/Yamago minigames branch on "UtilsSystem.isStandalone()" (playerType == "StandAlone" or "External"), and the two branches want OPPOSITE answers depending on the title:
+
+        - Agent P Strikes Back: its standalone branch loads a DEV harness ("../../deploy/MinigameAPI_*_DEV_ONLY_DO_NOT_PUBLISH.swf")
+        Disney never shipped to blank stage because it needs "PlugIn".
+        - Tron Uprising: Escape from Argon City: its standalone branch is fully OFFLINE ("onApiInit(null)", saves through a SharedObject),
+        while its plugin branch loads Disney's live API and then dereferences "api.dataStorageService" to null offline (TypeError #1009).
+        It needs "StandAlone" (i.e. Ruffle's own default).
+
+        So this is a per-GAME choice, not a global one.
+        Default = stock Ruffle behaviour:
+        the host opts a game in via "set_plugin_player_type" (see "ruffle_init").
+        A blanket "PlugIn" also caused the Pursuit of Hat 2 black screen (gaforflash), so the narrower the better.
+    */
+    let player_type = if cfg!(target_family = "wasm") || plugin_player_type() {
         "PlugIn"
     } else {
         match activation.context.avm2.player_runtime {

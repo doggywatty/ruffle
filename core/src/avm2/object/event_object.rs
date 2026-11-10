@@ -332,6 +332,24 @@ impl<'gc> EventObject<'gc> {
         )
     }
 
+    /*
+        A plain "ErrorEvent", the one Flash Player dispatches when a Stage3D context cannot be created.
+        Local patch: upstream leaves a TODO there and returns silently, which tells the movie nothing at all.
+    */
+    pub fn error_event(activation: &mut Activation<'_, 'gc>, error_msg: &str, error_code: u32, ) -> EventObject<'gc> {
+        let event_name = istr!("error");
+        let error_msg = AvmString::new_utf8(activation.gc(), error_msg);
+        let error_event_cls = activation.avm2().classes().errorevent;
+        Self::from_class_and_args(activation, error_event_cls, &[
+            event_name.into(),
+            false.into(),
+            false.into(),
+            error_msg.into(),
+            error_code.into(),
+        ],
+        )
+    }
+
     pub fn http_status_event(
         activation: &mut Activation<'_, 'gc>,
         status: u16,

@@ -4580,7 +4580,6 @@ dependencies = [
  "gc-arena",
  "hashbrown 0.16.1",
  "quick-xml",
- "regress",
  "ruffle_macros",
  "ruffle_wstr",
  "swf 0.2.2",

@@ -69,6 +69,11 @@ struct DomainDataMut<'gc> {
 const MIN_DOMAIN_MEMORY_LENGTH: usize = 1024;
 
 impl<'gc> Domain<'gc> {
+    // See "MovieLibrary::in_use" in library.rs
+    pub fn is_dead(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        Gc::is_dead(fc, self.0)
+    }
+
     fn cell(self) -> Ref<'gc, DomainDataMut<'gc>> {
         Gc::as_ref(self.0).cell.borrow()
     }
@@ -335,7 +340,7 @@ impl<'gc> Domain<'gc> {
             return;
         }
 
-        self.cell_mut(mc).defs.insert(name, script);
+        self.cell_mut(mc).defs.insert_at_end(name, script);
     }
 
     /// Export a class into the current application domain.
@@ -345,7 +350,7 @@ impl<'gc> Domain<'gc> {
         if self.has_class(export_name) {
             return;
         }
-        self.cell_mut(mc).classes.insert(export_name, class);
+        self.cell_mut(mc).classes.insert_at_end(export_name, class);
     }
 
     pub fn defs(&self) -> Ref<'_, PropertyMap<'gc, Script<'gc>>> {

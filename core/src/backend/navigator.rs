@@ -367,6 +367,19 @@ impl NullExecutor {
     pub fn run(&mut self) {
         self.0.run_until_stalled();
     }
+
+    /*
+        "run", one completed future at a time, stopping between two as soon as `stop` says so:
+        what is left runs at the next call.
+        A game loading thirty files in a row held the frontend's loop for as long (Dragon City), and the pause asked for meanwhile waited.
+    */
+    pub fn run_until(&mut self, mut stop: impl FnMut() -> bool) {
+        while !stop() {
+            if !self.0.try_run_one() {
+                break;
+            }
+        }
+    }
 }
 
 impl Default for NullExecutor {

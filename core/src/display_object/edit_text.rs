@@ -246,6 +246,11 @@ impl EditTextData<'_> {
 impl<'gc> EditText<'gc> {
     const ANY_NEWLINE: [char; 2] = ['\n', '\r'];
 
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared)
+    }
+
     // This seems to be OS-independent
     const INPUT_NEWLINE: char = '\r';
 

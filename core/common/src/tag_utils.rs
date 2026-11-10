@@ -17,7 +17,7 @@ pub struct SwfMovie {
     header: HeaderExt,
 
     /// Uncompressed SWF data.
-    data: Vec<u8>,
+    data: MovieData,
 
     /// The URL the SWF was downloaded from.
     url: String,
@@ -50,9 +50,151 @@ pub struct SwfMovie {
     sandbox_type: SandboxType,
 }
 
+/*
+	A range of a byte buffer shared, without a copy, between a ByteArray and what is made of it:
+	another ByteArray it is written into, and the movie Loader.loadBytes loads from it (SwfMovie::from_shared_data).
+	Each holder that writes takes a private copy first.
+
+	Worth noting that, Super Smash Flash 2 keeps every DAT file it downloads as a ByteArray (URLLoader.data),
+	copies the SWF inside into a second ByteArray and loads that one: the same bytes 3 times, plus a copy per step of the load.
+	
+	The SWFs inside are uncompressed, so a movie's tags were byte for byte the ByteArray's:
+	212 MB of ByteArrays next to 224 MB of movies when it ran out of memory.
+*/
+#[derive(Clone)]
+pub struct SharedBytes {
+    buf: Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedBytes {
+    pub fn new(buf: Vec<u8>) -> Self {
+        let end = buf.len();
+        Self {
+            buf: Arc::new(buf),
+            start: 0,
+            end,
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
+
+    /// Bytes `start..end` of this range, clamped to it.
+    pub fn sub(&self, start: usize, end: usize) -> Self {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        Self {
+            buf: self.buf.clone(),
+            start: self.start + start,
+            end: self.start + end,
+        }
+    }
+}
+
+impl Debug for SharedBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedBytes({} bytes)", self.len())
+    }
+}
+
+/*
+	A movie's data, its own or shared with a ByteArray (SharedBytes), counted while it lives (live_movie_stats),
+	to tell on the console whether loaded SWFs are ever freed.
+*/
+struct MovieData(MovieBytes);
+
+enum MovieBytes {
+    Owned(Vec<u8>),
+    Shared(SharedBytes),
+}
+
+static LIVE_MOVIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIVE_MOVIE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl MovieData {
+    fn new(data: Vec<u8>) -> Self {
+        Self::counted(MovieBytes::Owned(data))
+    }
+
+    fn shared(data: SharedBytes) -> Self {
+        Self::counted(MovieBytes::Shared(data))
+    }
+
+    fn counted(bytes: MovieBytes) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let data = Self(bytes);
+        LIVE_MOVIES.fetch_add(1, Relaxed);
+        LIVE_MOVIE_BYTES.fetch_add(data.as_slice().len() as u64, Relaxed);
+        data
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match &self.0 {
+            MovieBytes::Owned(data) => data,
+            MovieBytes::Shared(data) => data.as_slice(),
+        }
+    }
+}
+
+impl Clone for MovieData {
+    fn clone(&self) -> Self {
+        note_made(6);
+        match &self.0 {
+            MovieBytes::Owned(data) => Self::new(data.clone()),
+            MovieBytes::Shared(data) => Self::shared(data.clone()),
+        }
+    }
+}
+
+impl Drop for MovieData {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        LIVE_MOVIES.fetch_sub(1, Relaxed);
+        LIVE_MOVIE_BYTES.fetch_sub(self.as_slice().len() as u64, Relaxed);
+    }
+}
+
+// Movies alive, bytes of SWF data they hold.
+pub fn live_movie_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (LIVE_MOVIES.load(Relaxed), LIVE_MOVIE_BYTES.load(Relaxed))
+}
+
+/*
+	How many movies each constructor has made since boot, in the order empty, fake (length), fake (data), error, from_data, loaded image, copy.
+	The census line prints them, so a count of live movies that keeps climbing says which path makes them.
+*/
+static MOVIES_MADE: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn note_made(kind: usize) {
+    MOVIES_MADE[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// the counts behind "MOVIES_MADE"
+pub fn movies_made() -> [u64; 7] {
+    std::array::from_fn(|i| MOVIES_MADE[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl SwfMovie {
     /// Construct an empty movie.
     pub fn empty(swf_version: u8, loader_url: Option<String>) -> Self {
+        note_made(0);
         let url = "file:///".to_string();
         let header = HeaderExt::default_with_swf_version(swf_version);
 
@@ -60,7 +202,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: MovieData::new(vec![]),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -81,6 +223,7 @@ impl SwfMovie {
         loader_url: Option<String>,
         compressed_len: usize,
     ) -> Self {
+        note_made(1);
         let url = "file:///".to_string();
         let header = HeaderExt::default_with_swf_version(swf_version);
 
@@ -89,7 +232,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len,
-            data: Vec::new(),
+            data: MovieData::new(Vec::new()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -107,6 +250,7 @@ impl SwfMovie {
         loader_url: Option<String>,
         compressed_data: Vec<u8>,
     ) -> Self {
+        note_made(2);
         let url = "file:///".to_string();
         let header = HeaderExt::default_with_swf_version(swf_version);
 
@@ -115,7 +259,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len: compressed_data.len(),
-            data: compressed_data,
+            data: MovieData::new(compressed_data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -132,13 +276,14 @@ impl SwfMovie {
     /// This happens if no file could be loaded or if the loaded content is no valid
     /// supported content.
     pub fn error_movie(movie_url: String) -> Self {
+        note_made(3);
         let header = HeaderExt::default_error_header();
 
         // TODO What sandbox type should we use here?
         let sandbox_type = SandboxType::infer(movie_url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: MovieData::new(vec![]),
             url: movie_url,
             loader_url: None,
             parameters: Vec::new(),
@@ -156,13 +301,14 @@ impl SwfMovie {
         url: String,
         loader_url: Option<String>,
     ) -> Result<Self, swf::error::Error> {
+        note_made(4);
         let compressed_len = swf_data.len();
         let swf_buf = swf::read::decompress_swf(swf_data)?;
         let encoding = swf::SwfStr::encoding_for_version(swf_buf.header.version());
         let sandbox_type = SandboxType::infer(url.as_str(), &swf_buf.header);
         let mut movie = Self {
             header: swf_buf.header,
-            data: swf_buf.data,
+            data: MovieData::new(swf_buf.data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -176,8 +322,33 @@ impl SwfMovie {
         Ok(movie)
     }
 
+    /*
+		"from_data", for bytes shared with a ByteArray (`SharedBytes`):
+		An uncompressed movie keeps its tags in that buffer instead of a copy.
+		"decompress_swf" only strips the headers of an uncompressed movie, so its tags are the input's last bytes:
+		checked byte for byte before the copy is let go.
+	*/
+    pub fn from_shared_data(
+        bytes: &SharedBytes,
+        url: String,
+        loader_url: Option<String>,
+    ) -> Result<Self, swf::error::Error> {
+        let mut movie = Self::from_data(bytes.as_slice(), url, loader_url)?;
+        let input = bytes.as_slice();
+        let tags = movie.data.as_slice();
+        let start = input.len().checked_sub(tags.len());
+        if let Some(start) = start
+            && input.starts_with(b"FWS")
+            && input[start..] == *tags
+        {
+            movie.data = MovieData::shared(bytes.sub(start, input.len()));
+        }
+        Ok(movie)
+    }
+
     /// Construct a movie based on a loaded image (JPEG, GIF or PNG).
     pub fn from_loaded_image(url: String, length: usize, width: u32, height: u32) -> Self {
+        note_made(5);
         let stage_size = Rectangle::ZERO
             .with_width(Twips::from_pixels_i32(width as i32))
             .with_height(Twips::from_pixels_i32(height as i32));
@@ -185,7 +356,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         let mut movie = Self {
             header,
-            data: vec![],
+            data: MovieData::new(vec![]),
             url,
             loader_url: None,
             parameters: Vec::new(),
@@ -225,7 +396,7 @@ impl SwfMovie {
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_slice()
     }
 
     /// Returns the suggested string encoding for the given SWF version.
@@ -319,7 +490,7 @@ impl Debug for SwfMovie {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SwfMovie")
             .field("header", &self.header)
-            .field("data", &self.data.len())
+            .field("data", &self.data.as_slice().len())
             .field("url", &self.url)
             .field("loader_url", &self.loader_url)
             .field("parameters", &self.parameters)

@@ -15,7 +15,6 @@ hashbrown = { workspace = true }
 fnv = { workspace = true }
 gc-arena = { workspace = true }
 quick-xml = { workspace = true }
-regress = { workspace = true }
 ruffle_macros = { path = "../macros" }
 ruffle_wstr = { path = "../../wstr" }
 swf = { path = "../../swf" }

@@ -222,6 +222,14 @@ impl<'gc> LocalConnections<'gc> {
         if let Ok(url) = url::Url::parse(url) {
             if url.scheme() == "file" {
                 Cow::Borrowed("localhost")
+            } else if url.domain() == Some("flashforswitch.local") {
+                // FlashNX (2026-10-09): a SWF from the SD card runs under this
+                // made-up host, but it is a local file, and Flash answers
+                // "localhost" for one. Many sitelocks accept "localhost" for
+                // their authors' local tests: Super Smash Flash 2 Portable
+                // checks `new LocalConnection().domain` and showed its
+                // "unofficial website" screen instead of the menu (#112).
+                Cow::Borrowed("localhost")
             } else if let Some(domain) = url.domain() {
                 Cow::Owned(domain.to_owned())
             } else {

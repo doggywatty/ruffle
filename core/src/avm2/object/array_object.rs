@@ -127,6 +127,17 @@ impl<'gc> ArrayObject<'gc> {
         Gc::as_ref(self.0).array.borrow()
     }
 
+    /*
+        The storage for one read, without touching the borrow counter (the JIT's array helper):
+        "None" while it is mutably borrowed.
+
+        Safety:
+        The reference must be dropped before any code that could mutate the array runs.
+    */
+    pub unsafe fn flashnx_storage_unguarded(self) -> Option<&'gc ArrayStorage<'gc>> {
+        unsafe { Gc::as_ref(self.0).array.as_ref_cell().try_borrow_unguarded().ok() }
+    }
+
     pub fn storage_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ArrayStorage<'gc>> {
         unlock!(Gc::write(mc, self.0), ArrayObjectData, array).borrow_mut()
     }

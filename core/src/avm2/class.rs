@@ -241,6 +241,11 @@ impl<'gc> ClassData<'gc> {
 }
 
 impl<'gc> Class<'gc> {
+    // See "Avm2ClassRegistry::resurrect_movie" in library.rs
+    pub fn resurrect(self, fc: &gc_arena::Finalization<'gc>) {
+        Gc::resurrect(fc, self.0)
+    }
+
     pub fn as_ptr(self) -> *const () {
         Gc::as_ptr(self.0).cast()
     }
@@ -997,6 +1002,11 @@ impl<'gc> Class<'gc> {
 
     pub fn vtable(self) -> VTable<'gc> {
         *self.0.vtable.get().expect("VTable not yet initialized!")
+    }
+
+    // The vtable if it has been built already (see "VTableBuild::finish").
+    pub fn vtable_if_initialized(self) -> Option<VTable<'gc>> {
+        self.0.vtable.get().copied()
     }
 
     pub fn dollar_removed_name(self, mc: &Mutation<'gc>) -> QName<'gc> {

@@ -3,13 +3,13 @@ use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
 use crate::backend::audio::SoundHandle;
 use crate::character::Character;
 
-use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
+use crate::display_object::{Bitmap, Graphic, MorphShape, MovieClip, MovieClipWeak, Text};
 use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
 use gc_arena::collect::Trace;
-use gc_arena::{Collect, Mutation};
+use gc_arena::{Collect, Finalization, Gc, GcWeak, Mutation};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::utils::remove_invalid_jpeg_data;
@@ -18,6 +18,7 @@ use crate::backend::ui::{FontDefinition, UiBackend};
 use crate::font::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use weak_table::{PtrWeakKeyHashMap, WeakValueHashMap, traits::WeakElement};
 
@@ -49,12 +50,26 @@ pub struct Avm2ClassRegistry<'gc> {
     /// A list of AVM2 class objects and the character IDs they are expected to
     /// instantiate.
     class_map: WeakValueHashMap<Avm2Class<'gc>, WeakMovieSymbol>,
+
+    /*
+        The movies whose library was released ("Library::release_movie"), by address.
+        
+        Their classes are not traced from here:
+        a class holds its movie through its code,
+        so tracing them would keep the movie in use for good.
+
+        "Library::finalize_released" keeps or drops them.
+    */
+    released: FnvHashSet<usize>,
 }
 
 unsafe impl<'gc> Collect<'gc> for Avm2ClassRegistry<'gc> {
     fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
-        for (k, _) in self.class_map.iter() {
-            cc.trace(k);
+        for (k, symbol) in self.class_map.iter() {
+            if self.released.is_empty() || !self.released.contains(&(Arc::as_ptr(&symbol.0) as usize))
+            {
+                cc.trace(k);
+            }
         }
     }
 }
@@ -69,7 +84,33 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     pub fn new() -> Self {
         Self {
             class_map: WeakValueHashMap::new(),
+            released: FnvHashSet::default(),
         }
+    }
+
+    // Keeps the classes of "movie", released but still in use, alive for the current collection (see "Library::finalize_released").
+    fn resurrect_movie(&self, fc: &Finalization<'gc>, movie: &Arc<SwfMovie>) {
+        for (class, symbol) in self.class_map.iter() {
+            if Arc::ptr_eq(&symbol.0, movie) {
+                class.resurrect(fc);
+            }
+        }
+    }
+
+    /*
+        Forgets the classes of a released movie whose library is dropped.
+        
+        They are about to be freed: none may stay in the map.
+        
+        By key: weak_table's "retain" can pass over the entry that its backward-shift deletion moves into a slot it has already visited
+        (found by the same work upstream, see "Library::release_movie").
+    */
+    fn remove_movie(&mut self, movie: &Arc<SwfMovie>) {
+        let classes: Vec<Avm2Class<'gc>> = self.class_map.iter().filter(|(_, symbol)| Arc::ptr_eq(&symbol.0, movie)).map(|(class, _)| *class).collect();
+        for class in classes {
+            self.class_map.remove(&class);
+        }
+        self.released.remove(&(Arc::as_ptr(movie) as usize));
     }
 
     /// Retrieve the library symbol for a given AVM2 class object.
@@ -123,9 +164,21 @@ pub struct MovieLibrary<'gc> {
     characters: HashMap<CharacterId, Character<'gc>>,
     export_characters: Avm1PropertyMap<'gc, CharacterId>,
     imported_assets: HashMap<AvmString<'gc>, CharacterId>,
-    jpeg_tables: Option<Vec<u8>>,
+
+    /*
+        shared, so a DefineBits bitmap can keep a reference to the tables and glue them in when it is decoded,
+        instead of storing its own glued copy of the image for the life of the movie.
+    */
+    jpeg_tables: Option<Arc<[u8]>>,
+
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
+    // set once the Loader that loaded this movie unloaded it ("Library::release_movie"`), with the root clip it had then.
+    released: bool,
+    released_root: Option<MovieClipWeak<'gc>>,
+    // resurrected in the current collection ("finalize_released").
+    #[collect(require_static)]
+    kept: std::cell::Cell<bool>,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -138,7 +191,20 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+            released: false,
+            released_root: None,
+            kept: std::cell::Cell::new(false),
         }
+    }
+
+    /*
+        Whether anything outside this released (so untraced) library still uses its movie,
+        in a collection about to sweep:
+        its AVM2 domain (every live object, class or function of the movie's code reaches it),
+        its root clip, or an instance of one of its symbols.
+    */
+    fn in_use(&self, fc: &Finalization<'gc>) -> bool {
+        self.avm2_domain.is_some_and(|domain| !domain.is_dead(fc)) || self.released_root.is_some_and(|root| !root.is_dead(fc)) || self.characters.values().any(|character| character.has_live_instances(fc))
     }
 
     /// Registers a character; returns `true` if successful, or `false` if a character with
@@ -255,7 +321,8 @@ impl<'gc> MovieLibrary<'gc> {
         match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
-                let bitmap = bitmap.compressed().decode().unwrap();
+                // Never unwrap this (see "decode_or_stand_in").
+                let bitmap = bitmap.compressed().decode_or_stand_in();
                 let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
                 Some(bitmap.instantiate(mc))
@@ -337,12 +404,17 @@ impl<'gc> MovieLibrary<'gc> {
         self.jpeg_tables = if data.is_empty() {
             None
         } else {
-            Some(remove_invalid_jpeg_data(data).to_vec())
+            Some(Arc::from(remove_invalid_jpeg_data(data).as_ref()))
         }
     }
 
     pub fn jpeg_tables(&self) -> Option<&[u8]> {
-        self.jpeg_tables.as_ref().map(|data| &data[..])
+        self.jpeg_tables.as_deref()
+    }
+
+    // The same tables, as a handle a bitmap can keep.
+    pub fn jpeg_tables_shared(&self) -> Option<Arc<[u8]>> {
+        self.jpeg_tables.clone()
     }
 
     pub fn set_avm2_domain(&mut self, avm2_domain: Avm2Domain<'gc>) {
@@ -398,9 +470,66 @@ unsafe impl<'gc> Collect<'gc> for MovieLibraries<'gc> {
     #[inline]
     fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
         for (_, val) in self.0.iter() {
-            cc.trace(val);
+            if val.released {
+                /*
+                    A released library holds its contents only while something else uses its movie:
+                    "Library::finalize_released" resurrects or drops it before every sweep.
+                    Its weak pointers are traced as such, so they stay valid.
+                */
+                val.trace(&mut WeakOnly(&mut *cc));
+            } else {
+                cc.trace(val);
+            }
         }
     }
+}
+
+// Passes on only the weak pointers (see "MovieLibraries::trace").
+struct WeakOnly<'a, C>(&'a mut C);
+
+impl<'gc, C: Trace<'gc>> Trace<'gc> for WeakOnly<'_, C> {
+    fn trace_gc(&mut self, _gc: Gc<'gc, ()>) {}
+
+    fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>) {
+        self.0.trace_gc_weak(gc)
+    }
+}
+
+/*
+    Keeps every pointer it is shown alive for the current collection (see "Library::finalize_released"), and through them all they hold.
+    Weak pointers need nothing: they were traced as such.
+*/
+struct Resurrect<'a, 'gc>(&'a Finalization<'gc>);
+
+impl<'gc> Trace<'gc> for Resurrect<'_, 'gc> {
+    fn trace_gc(&mut self, gc: Gc<'gc, ()>) {
+        Gc::resurrect(self.0, gc)
+    }
+
+    fn trace_gc_weak(&mut self, _gc: GcWeak<'gc, ()>) {}
+}
+
+// "moviefree.off" marker (see "Library::release_movie").
+static MOVIE_FREE: AtomicBool = AtomicBool::new(true);
+static MOVIES_RELEASED: AtomicU32 = AtomicU32::new(0);
+static MOVIES_DROPPED: AtomicU32 = AtomicU32::new(0);
+static MOVIES_KEPT: AtomicU32 = AtomicU32::new(0);
+
+// whether the libraries of unloaded movies may be dropped.
+pub fn set_movie_free(enabled: bool) {
+    MOVIE_FREE.store(enabled, Relaxed);
+}
+
+/*
+    movies released since boot, libraries dropped since boot,
+    and released ones still in use at the last collection ("census:" line).
+*/
+pub fn movie_free_stats() -> (u32, u32, u32) {
+    (
+        MOVIES_RELEASED.load(Relaxed),
+        MOVIES_DROPPED.load(Relaxed),
+        MOVIES_KEPT.load(Relaxed),
+    )
 }
 
 impl<'gc> MovieLibraries<'gc> {
@@ -480,6 +609,105 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.movie_libraries.known_movies()
+    }
+
+    /*
+        Called when a Loader unloads "movie" ("LoaderInfoObject::unload").
+
+        Upstream never frees a loaded movie:
+        its library holds it, and the libraries are held for good.
+        Super Smash Flash 2 unloads its oldest characters and stages past 12 and 10 ("Resource.unload", "unloadAndStop")
+        and loads them again when needed:
+        
+        each load was a new movie kept forever, until the heap ran out in a second Classic run.
+        
+        A released library is no longer traced:
+        each collection keeps it whole while anything else uses the movie,
+        and drops it otherwise ("finalize_released"),
+        after which the collector frees all that only it held.
+        
+        Upstream's work on the same leak: ruffle PRs #22908 and #23071, open.
+    */
+    pub fn release_movie(&mut self, movie: &Arc<SwfMovie>, root: Option<MovieClip<'gc>>) {
+        if !MOVIE_FREE.load(Relaxed) {
+            return;
+        }
+        let Some(library) = self.movie_libraries.0.get_mut(movie) else {
+            return;
+        };
+        if library.released {
+            return;
+        }
+        library.released = true;
+        library.released_root = root.map(|root| root.downgrade());
+        self.avm2_class_registry.released.insert(Arc::as_ptr(movie) as usize);
+        MOVIES_RELEASED.fetch_add(1, Relaxed);
+    }
+
+    // Whether a collection has released libraries to finalize.
+    pub fn has_released(&self) -> bool {
+        !self.avm2_class_registry.released.is_empty()
+    }
+
+    /*
+        1 finalization pass, run with the arena fully marked:
+        the passes run to their end before EVERY sweep ("finalize_released_libraries" in player.rs):
+        a released library is not traced, so one left in place without being resurrected would point at freed objects.
+
+        Resurrects, whole, each released library not yet kept in this collection whose movie is in use ("MovieLibrary::in_use"),
+        and returns true if it did:
+        
+        what it holds may reach another released library's anchors (a kept movie holding a class of another),
+        which "is_dead" only shows once marking has run again, so another pass must follow.
+        
+        A pass that resurrects nothing is the last:
+        it drops the released libraries not kept, with their symbol classes,
+        and returns their sounds for the audio backend to forget.
+    */
+    pub fn finalize_released(&mut self, fc: &Finalization<'gc>) -> (bool, Vec<SoundHandle>) {
+        let mut resurrected = false;
+        for (movie, library) in self.movie_libraries.0.iter() {
+            if library.released && !library.kept.get() && library.in_use(fc) {
+                library.trace(&mut Resurrect(fc));
+                self.avm2_class_registry.resurrect_movie(fc, &movie);
+                library.kept.set(true);
+                resurrected = true;
+            }
+        }
+        if resurrected {
+            return (true, Vec::new());
+        }
+        let mut dead = Vec::new();
+        let mut kept = 0;
+        for (movie, library) in self.movie_libraries.0.iter() {
+            if !library.released {
+                continue;
+            }
+            if library.kept.replace(false) {
+                kept += 1;
+            } else {
+                dead.push(movie);
+            }
+        }
+        MOVIES_KEPT.store(kept, Relaxed);
+        let mut sounds = Vec::new();
+        for movie in dead {
+            self.avm2_class_registry.remove_movie(&movie);
+            if let Some(library) = self.movie_libraries.0.remove(&movie) {
+                sounds.extend(library.characters.values().filter_map(|c| match c {
+                    Character::Sound(sound) => Some(*sound),
+                    _ => None,
+                }));
+                tracing::info!(
+                    "moviefree: dropped the library of an unloaded movie ({} KB, {} characters, {} still released)",
+                    movie.data().len() / 1024,
+                    library.characters.len(),
+                    kept,
+                );
+            }
+            MOVIES_DROPPED.fetch_add(1, Relaxed);
+        }
+        (false, sounds)
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)

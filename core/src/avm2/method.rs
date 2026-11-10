@@ -136,6 +136,10 @@ struct MethodData<'gc> {
     /// This is true when the method is a free-standing function and none of the
     /// declared arguments have a type or a default value.
     is_unchecked: bool,
+
+    // JIT state ("activation_jit.rs"): calls so far, then the address of the compiled code, or "usize::MAX" once rejected.
+    #[collect(require_static)]
+    flashnx_jit: std::cell::Cell<usize>,
 }
 
 impl PartialEq for Method<'_> {
@@ -153,6 +157,16 @@ impl core::fmt::Debug for Method<'_> {
 }
 
 impl<'gc> Method<'gc> {
+    // Identity of this method for the AS3 profiler ("flashnx_as3prof").
+    pub fn flashnx_key(&self) -> usize {
+        Gc::as_ptr(self.0) as usize
+    }
+
+    // this method's JIT state (see "activation_jit.rs").
+    pub fn flashnx_jit(&self) -> &std::cell::Cell<usize> {
+        &self.0.flashnx_jit
+    }
+
     /// Construct a `Method` from an `AbcFile` and method index.
     pub fn from_method_index(
         txunit: TranslationUnit<'gc>,
@@ -220,6 +234,7 @@ impl<'gc> Method<'gc> {
                 association: OnceLock::new(),
                 is_function,
                 is_unchecked: is_function && all_params_unchecked,
+                flashnx_jit: std::cell::Cell::new(0),
             },
         )))
     }

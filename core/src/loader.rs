@@ -33,7 +33,7 @@ use crate::limits::ExecutionLimit;
 use crate::player::{Player, PostFrameCallback};
 use crate::streams::{NetStream, NetStreamHandle};
 use crate::string::{AvmString, StringContext};
-use crate::tag_utils::SwfMovie;
+use crate::tag_utils::{SharedBytes, SwfMovie};
 use crate::vminterface::Instantiator;
 use chardetng::EncodingDetector;
 use encoding_rs::{UTF_8, WINDOWS_1252};
@@ -393,7 +393,7 @@ impl<'gc> LoadManager<'gc> {
     pub fn load_movie_into_clip_bytes(
         context: &mut UpdateContext<'gc>,
         target_clip: DisplayObject<'gc>,
-        bytes: Vec<u8>,
+        bytes: SharedBytes,
         vm_data: MovieLoaderVMData<'gc>,
     ) -> Result<(), Error> {
         let loader = MovieLoader {
@@ -820,6 +820,7 @@ impl<'gc> MovieLoader<'gc> {
                 status,
                 redirected,
                 loader_url,
+                None,
             )
         })?;
         Ok(())
@@ -859,7 +860,7 @@ impl<'gc> MovieLoader<'gc> {
     pub fn movie_loader_bytes(
         handle: LoaderHandle,
         uc: &mut UpdateContext<'gc>,
-        bytes: Vec<u8>,
+        bytes: SharedBytes,
     ) -> Result<(), Error> {
         let clip = match uc.load_manager.get_loader(handle) {
             Some(Self { target_clip, .. }) => *target_clip,
@@ -882,9 +883,9 @@ impl<'gc> MovieLoader<'gc> {
         let loader_url = Some(uc.root_swf.url().to_string());
 
         if replacing_root_movie {
-            ContentType::sniff(&bytes).expect(ContentType::Swf)?;
+            ContentType::sniff(bytes.as_slice()).expect(ContentType::Swf)?;
 
-            let movie = SwfMovie::from_data(&bytes, "file:///".into(), loader_url)?;
+            let movie = SwfMovie::from_shared_data(&bytes, "file:///".into(), loader_url)?;
             avm2_stub_method_context!(
                 uc,
                 "flash.display.Loader",
@@ -895,8 +896,73 @@ impl<'gc> MovieLoader<'gc> {
             return Ok(());
         }
 
-        MovieLoader::movie_loader_data(handle, uc, &bytes, "file:///".into(), 0, false, loader_url)
+        /*
+            Backport of upstream ruffle#24025 (09efa268d),
+            for ActionScript 3 movies only.
+            
+            In Flash Player a movie loaded with "Loader.loadBytes"
+            has the loading SWF's URL followed by "/[[DYNAMIC]]/<n>", and games check it:
+            
+            Happy Wheels only starts when "root.loaderInfo.url" names its site (#130),
+            and "file:///" stopped it after its preloader.
+            
+            Not for ActionScript 2 movies:
+            their SharedObjects are stored under their own movie's URL (avm1 shared_object.rs),
+            so an AS2 game unwrapped by an AS3 loader would lose its saves: AS3 ones go under the root movie's URL, unchanged.
+        */
+        let url = match (&loader_url, flashnx_is_as3(bytes.as_slice())) {
+            (Some(loader_url), Some(true)) => format!("{loader_url}/[[DYNAMIC]]/1"),
+            _ => "file:///".into(),
+        };
+
+        MovieLoader::movie_loader_data(
+            handle,
+            uc,
+            bytes.as_slice(),
+            url,
+            0,
+            false,
+            loader_url,
+            Some(&bytes),
+        )
     }
+}
+
+/*
+    Whether "bytes" is an ActionScript 3 movie, read from its first tag (FileAttributes) only, without inflating the whole movie twice.
+    "None" when that cannot be told cheaply (LZMA, not a SWF).
+*/
+fn flashnx_is_as3(bytes: &[u8]) -> Option<bool> {
+    use std::io::Read;
+    let head: Vec<u8> = match bytes.get(0..3)? {
+        b"FWS" => bytes.get(..bytes.len().min(512))?.to_vec(),
+        b"CWS" => {
+            let mut out = bytes.get(..8)?.to_vec();
+            let mut buf = [0u8; 512];
+            let mut decoder = flate2::read::ZlibDecoder::new(bytes.get(8..)?);
+            let mut filled = 0;
+            while filled < buf.len() {
+                match decoder.read(&mut buf[filled..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => filled += n,
+                }
+            }
+            out.extend_from_slice(&buf[..filled]);
+            out
+        }
+        _ => return None,
+    };
+    if *head.get(3)? < 9 {
+        return Some(false);
+    }
+    let nbits = (*head.get(8)? >> 3) as usize;
+    let first_tag = 8 + (5 + 4 * nbits).div_ceil(8) + 4;
+    let code_len = u16::from_le_bytes([*head.get(first_tag)?, *head.get(first_tag + 1)?]);
+    if code_len >> 6 != 69 {
+        return Some(false);
+    }
+    let body = if code_len & 0x3F == 0x3F { first_tag + 6 } else { first_tag + 2 };
+    Some(*head.get(body)? & 0x08 != 0)
 }
 
 /// Kick off the root movie load.
@@ -1600,14 +1666,17 @@ impl<'gc> MovieLoader<'gc> {
         status: u16,
         redirected: bool,
         loader_url: Option<String>,
+        // "data" as a buffer shared with a ByteArray (loadBytes).
+        shared: Option<&SharedBytes>,
     ) -> Result<(), Error> {
         let sniffed_type = ContentType::sniff(data);
         let length = data.len();
 
-        if sniffed_type == ContentType::Unknown
-            && let Ok(data) = extract_swz(data)
+        if sniffed_type == ContentType::Unknown && let Ok(data) = extract_swz(data)
         {
-            return Self::movie_loader_data(handle, uc, &data, url, status, redirected, loader_url);
+            return Self::movie_loader_data(
+                handle, uc, &data, url, status, redirected, loader_url, None,
+            );
         }
         let (clip, vm_data, from_bytes) = match uc.load_manager.get_loader(handle) {
             Some(Self {
@@ -1648,7 +1717,12 @@ impl<'gc> MovieLoader<'gc> {
 
         let movie = match sniffed_type {
             ContentType::Swf => {
-                let mut movie = SwfMovie::from_data(data, url.clone(), loader_url.clone())?;
+                let mut movie = match shared {
+                    Some(shared) => {
+                        SwfMovie::from_shared_data(shared, url.clone(), loader_url.clone())?
+                    }
+                    None => SwfMovie::from_data(data, url.clone(), loader_url.clone())?,
+                };
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
                     // If AVM1 loads a SWF, that SWF is always interpreted as
@@ -2042,6 +2116,8 @@ impl<'gc> MovieLoader<'gc> {
             // frame behind objects placed by the timeline (even if they were
             // both placed in the same frame to begin with).
             mc.base().set_skip_next_enter_frame(true);
+            // The next enter_frame must visit it to consume the flag.
+            crate::display_object::mark_enter_needed(mc.into());
 
             let flashvars = movie.as_ref().unwrap().parameters();
             if let Some(object) = mc.object1() {

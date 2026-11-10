@@ -112,6 +112,16 @@ fn constructor<'gc>(
         return Ok(Value::Undefined);
     }
 
+    /*
+		OOM guard (New Super Bowser World cutscene): the game spawns dozens of ~8.5 MB surfaces and holds them all, exhausting the CPU heap.
+		Past the budget, refuse like an invalid size, "undefined` is a value AVM1 games already cope with (they routinely "new BitmapData(0,0)"),
+		so this drops a surface instead of aborting the whole app.
+	*/
+    if crate::bitmap::bitmap_data::bitmapdata_would_exceed_budget(width, height) {
+        tracing::warn!("BitmapData OVER BUDGET: refusing {}x{} (live={} MB)", width, height, crate::bitmap::bitmap_data::bitmapdata_live_bytes() / (1024 * 1024));
+        return Ok(Value::Undefined);
+    }
+
     let bitmap_data = BitmapData::new(
         activation.context.gc_context,
         width,
@@ -1313,7 +1323,9 @@ fn load_bitmap<'gc>(
     let Some((_id, Character::Bitmap(bitmap))) = character else {
         return Ok(Value::Undefined);
     };
-    let bitmap = bitmap.compressed().decode().unwrap();
+    
+	// never unwrap this (see "decode_or_stand_in")
+    let bitmap = bitmap.compressed().decode_or_stand_in();
 
     let transparency = true;
     let bitmap_data = BitmapData::new_with_pixels(

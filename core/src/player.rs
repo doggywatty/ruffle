@@ -43,6 +43,7 @@ use crate::frame_lifecycle::{FramePhase, run_all_phases_avm2};
 use crate::input::InputEvent;
 use crate::input::InputManager;
 use crate::library::Library;
+use crate::backend::audio::SoundHandle;
 use crate::limits::ExecutionLimit;
 use crate::loader::{LoadBehavior, LoadManager};
 use crate::local_connection::LocalConnections;
@@ -74,6 +75,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak as RcWeak};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tracing::instrument;
@@ -275,6 +277,304 @@ impl<'gc> GcRootData<'gc> {
 }
 
 type GcArena = gc_arena::Arena<Rootable![GcRoot<'_>]>;
+
+/*
+    Instrumentation for the periodic tick spike.
+
+    Mario 63 shows packets of 4-7 frames at 300-500 ms of "tick", returning every ~28 frames, entirely inside "Player::tick".
+    2 mechanisms can produce that shape and we cannot tell them apart from the outside:
+
+    A. the gc-arena cycle, "Sleeping" does no work until the Gc heap has grown 50%,
+    then "Marking/Sweeping" cost time proportional to the live set, then back to sleep:
+    B. frame catch-up, "tick" may run up to "MAX_FRAMES_PER_TICK" = 5 SWF frames in one call, and 5 x 60 ms lands squarely in the observed range.
+
+    These three counters make the difference visible on the "SLOW" line.
+    Kept as statics rather than "Player" fields so "PlayerBuilder" is untouched:
+    there is exactly one "Player" alive at a time in FlashNX.
+*/
+static FLASHNX_FRAMES_RUN: AtomicU32 = AtomicU32::new(0);
+static FLASHNX_GC_PHASE: AtomicU8 = AtomicU8::new(0);
+static FLASHNX_GC_ALLOC: AtomicU64 = AtomicU64::new(0);
+static FLASHNX_GC_US: AtomicU64 = AtomicU64::new(0);
+/*
+    The frame accumulator after the last "tick", in microseconds:
+    wall time received but not yet turned into frames.
+    The FPS counter adds its change over a window to the frames it counted,
+    so the reading is not rounded to whole frames (a game keeping up exactly read x1.03 at times).
+*/
+static FLASHNX_FRAME_ACC_US: AtomicU64 = AtomicU64::new(0);
+
+/*
+    Snapshot of the last "tick":
+    SWF frames actually run, collector phase (0 sleeping, 1 marking, 2 marked, 3 sweeping),
+    total arena allocation, and microseconds spent inside the collector call itself.
+    
+    cacheAsBitmap on (default), or every display object drawn directly ("bitmapcache.off" marker),
+    to tell whether a misplaced graphic comes from the cached-bitmap path.
+*/
+static BITMAP_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_bitmap_cache(enabled: bool) {
+    BITMAP_CACHE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+// set by AS3 "System.gc()", consumed by the next "update".
+static FULL_GC_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// arena size past which "GC_TIGHT_PACING" replaces the default.
+const GC_TIGHT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Shorter sleep, and 0.7x the default work factors (each allocated byte buys more collection), so a cycle finishes after less allocation.
+const GC_TIGHT_PACING: gc_arena::metrics::Pacing = gc_arena::metrics::Pacing {
+    sleep_factor: 0.25,
+    min_sleep: 4096,
+    mark_factor: 0.07,
+    trace_factor: 0.28,
+    keep_factor: 0.035,
+    drop_factor: 0.14,
+    free_factor: 0.21,
+};
+
+/*
+    Live arena below which "gc_small_pacing"` lets the collector sleep longer.
+    
+    Flash Player's own collector (MMgc `GCPolicyManager`) let a heap grow by a load factor that shrinks with its size,
+    2.5x under 10 MB down to 1.125x past 300 MB,
+    and loosened it further whenever collecting took over a
+    quarter of the time. gc-arena's default sleeps 0.5x the live heap whatever
+    its size, so a game that allocates fast on a small heap never lets it rest:
+    Happy Wheels (Box2D, a 29-37 MB arena) had the collector awake in three
+    frames out of four, 6.3 ms of a 60 ms frame (2026-10-08).
+*/
+const GC_SMALL_BYTES: usize = 32 * 1024 * 1024;
+const GC_MID_BYTES: usize = 64 * 1024 * 1024;
+
+/*
+    live arena size when the last cycle finished (0 before the first).
+    The pacing is chosen on this rather than on the current total,
+    which swings with the garbage of the cycle in progress and would switch the pacing back and forth between cycles.
+*/
+static FLASHNX_GC_LIVE: AtomicU64 = AtomicU64::new(0);
+
+// "gc_small_pacing" on (default) or off ("gcsmall.off" marker, and the profiling build's A/B).
+static GC_SMALL: AtomicBool = AtomicBool::new(true);
+
+pub fn set_gc_small_pacing(enabled: bool) {
+    GC_SMALL.store(enabled, Ordering::Relaxed);
+}
+
+/*
+    The pacing for an arena of "total" bytes, "live" of them alive after the last cycle.
+    Sleeping 2x the live heap leaves about 6x the live heap allocated at the end of a cycle (192 MB at 32 MB live),
+    1x about 4x (256 MB at 64 MB live): past that the default, then the tight pacing.
+*/
+fn gc_pacing(total: usize, live: usize) -> gc_arena::metrics::Pacing {
+    use gc_arena::metrics::Pacing;
+    if total > GC_TIGHT_BYTES {
+        return GC_TIGHT_PACING;
+    }
+    if GC_SMALL.load(Ordering::Relaxed) && live != 0 {
+        if live < GC_SMALL_BYTES {
+            return Pacing { sleep_factor: 2.0, ..Pacing::DEFAULT };
+        }
+        if live < GC_MID_BYTES {
+            return Pacing { sleep_factor: 1.0, ..Pacing::DEFAULT };
+        }
+    }
+    Pacing::DEFAULT
+}
+
+/*
+    Ask for a full collection after the current update, at most once every 10 s:
+    some games call "System.gc()" every frame, and a full cycle of a few hundred MB costs the Switch a second or more.
+*/
+pub fn request_full_gc() {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now_ms = ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if last == u64::MAX || now_ms.saturating_sub(last) >= 10_000 {
+        LAST_MS.store(now_ms, Ordering::Relaxed);
+        FULL_GC_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+/*
+    Whether the "render" handlers count in a frame's cost for catch-up (see "Player::render").
+    Off from FlashNX's "rendercost.off" marker, to compare.
+*/
+static RENDER_COST: AtomicBool = AtomicBool::new(true);
+
+pub fn set_render_cost(enabled: bool) {
+    RENDER_COST.store(enabled, Ordering::Relaxed);
+}
+
+/*
+    Called from inside a running script where the timeout is checked
+    (every 2 000 AVM1 actions, every 10 000 AVM2 ops, compiled code included),
+    with how long the frame has run and the renderer.
+    A script can hold one frame for up to 60 s ("script_limits"),
+    and the frontend draws nothing in between frames:
+    it opens its pause from here instead, the script waiting,
+    as Flash Player put its "a script is running slowly" dialog at the same place.
+    
+    Answers whether to stop the script (as the timeout would), and how long it was held,
+    which the timeout does not count. Unset, nothing changes.
+*/
+pub type ScriptHook = fn(Duration, &mut dyn RenderBackend) -> (bool, Duration);
+static SCRIPT_HOOK: std::sync::OnceLock<ScriptHook> = std::sync::OnceLock::new();
+
+pub fn set_script_hook(hook: ScriptHook) {
+    let _ = SCRIPT_HOOK.set(hook);
+}
+
+#[inline]
+pub(crate) fn flashnx_script_hook(elapsed: Duration, renderer: &mut dyn RenderBackend) -> (bool, Duration) {
+    match SCRIPT_HOOK.get() {
+        Some(hook) => hook(elapsed, renderer),
+        None => (false, Duration::ZERO),
+    }
+}
+
+/// see "FLASHNX_FRAME_ACC_US".
+pub fn flashnx_frame_accumulator_us() -> u64 {
+    FLASHNX_FRAME_ACC_US.load(Ordering::Relaxed)
+}
+
+pub fn flashnx_gc_probe() -> (u32, u8, u64, u64) {
+    (
+        FLASHNX_FRAMES_RUN.load(Ordering::Relaxed),
+        FLASHNX_GC_PHASE.load(Ordering::Relaxed),
+        FLASHNX_GC_ALLOC.load(Ordering::Relaxed),
+        FLASHNX_GC_US.load(Ordering::Relaxed),
+    )
+}
+
+/*
+    AVM1 actions run this tick, and the ticks (ARM generic timer)
+    spent decoding them and running bytecode at all.
+    Zeros unless the "flashnx_instr" feature is on.
+*/
+pub fn flashnx_avm1_probe() -> (u64, u64, u64) {
+    #[cfg(feature = "flashnx_instr")]
+    {
+        use crate::avm1 as a;
+        (
+            a::FLASHNX_AVM1_ACTIONS.load(Ordering::Relaxed),
+            a::FLASHNX_AVM1_DECODE_TICKS.load(Ordering::Relaxed),
+            a::FLASHNX_AVM1_TOTAL_TICKS.load(Ordering::Relaxed),
+        )
+    }
+    #[cfg(not(feature = "flashnx_instr"))]
+    {
+        (0, 0, 0)
+    }
+}
+
+/*
+    Cumulative exclusive ticks and counts per AVM1 action code (never reset: the caller differences them).
+    Zeros unless "flashnx_instr".
+*/
+pub fn flashnx_avm1_ops() -> ([u64; 256], [u64; 256]) {
+    // Filled only with "flashnx_instr".
+    #[allow(unused_mut)]
+    let mut ticks = [0u64; 256];
+    #[allow(unused_mut)]
+    let mut counts = [0u64; 256];
+    #[cfg(feature = "flashnx_instr")]
+    for i in 0..256 {
+        ticks[i] = crate::avm1::FLASHNX_OP_TICKS[i].load(Ordering::Relaxed);
+        counts[i] = crate::avm1::FLASHNX_OP_COUNT[i].load(Ordering::Relaxed);
+    }
+    (ticks, counts)
+}
+
+// Turn the per-name tables below on ("avm1names.on"). No-op unless "flashnx_instr".
+pub fn flashnx_set_avm1_named(on: bool) {
+    #[cfg(feature = "flashnx_instr")]
+    crate::avm1::flashnx_set_avm1_named(on);
+    #[cfg(not(feature = "flashnx_instr"))]
+    let _ = on;
+}
+
+/*
+    The per-name tables of CallMethod and GetMember since the last call (they are emptied),
+    each sorted by exclusive ticks, the "top" first:
+    "(name, [calls, ticks, calls on a display object])".
+*/
+pub fn flashnx_avm1_named_take(top: usize) -> [Vec<(String, [u64; 3])>; 2] {
+    #[allow(unused_mut)]
+    let mut out = [Vec::new(), Vec::new()];
+    #[cfg(feature = "flashnx_instr")]
+    for (slot, table) in out
+        .iter_mut()
+        .zip([&crate::avm1::FLASHNX_CALL_NAMES, &crate::avm1::FLASHNX_GET_NAMES])
+    {
+        let map = table.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        let mut rows: Vec<_> = map.into_iter().collect();
+        rows.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+        rows.truncate(top);
+        *slot = rows.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    }
+    #[cfg(not(feature = "flashnx_instr"))]
+    let _ = top;
+    out
+}
+
+// Cumulative timeline goto counters (see "FLASHNX_GOTO"). Again, zeros unless "flashnx_instr".
+pub fn flashnx_goto_probe() -> [u64; 7] {
+    #[allow(unused_mut)]
+    let mut out = [0u64; 7];
+    #[cfg(feature = "flashnx_instr")]
+    for (o, c) in out.iter_mut().zip(crate::display_object::FLASHNX_GOTO.iter()) {
+        *o = c.load(Ordering::Relaxed);
+    }
+    out
+}
+
+// Cumulative child-by-name lookups, children compared, and ticks.
+pub fn flashnx_getname_probe() -> (u64, u64, u64) {
+    #[cfg(feature = "flashnx_instr")]
+    {
+        use crate::display_object as d;
+        (
+            d::FLASHNX_GETNAME_CALLS.load(Ordering::Relaxed),
+            d::FLASHNX_GETNAME_SCANNED.load(Ordering::Relaxed),
+            d::FLASHNX_GETNAME_TICKS.load(Ordering::Relaxed),
+        )
+    }
+    #[cfg(not(feature = "flashnx_instr"))]
+    {
+        (0, 0, 0)
+    }
+}
+
+// Turn the AVM1 clip-reference cache on or off (on by default: see "FLASHNX_MCREF_CACHE" in avm1/object_reference.rs).
+pub fn flashnx_set_mcref_cache(on: bool) {
+    crate::avm1::flashnx_set_mcref_cache(on);
+}
+
+/*
+    Whether that cache is on, then this tick's clip references handed out,
+    how many came from the cache, and the ticks spent (instr only).
+*/
+pub fn flashnx_mcref_probe() -> (bool, u64, u64, u64) {
+    let on = crate::avm1::flashnx_mcref_cache_on();
+    #[cfg(feature = "flashnx_instr")]
+    {
+        use crate::avm1 as a;
+        (
+            on,
+            a::FLASHNX_MCREF_CALLS.load(Ordering::Relaxed),
+            a::FLASHNX_MCREF_HITS.load(Ordering::Relaxed),
+            a::FLASHNX_MCREF_TICKS.load(Ordering::Relaxed),
+        )
+    }
+    #[cfg(not(feature = "flashnx_instr"))]
+    {
+        (on, 0, 0, 0)
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum RunState {
@@ -519,9 +819,168 @@ impl Player {
         FloatDuration::from_millis(self.frame_time(1000.0))
     }
 
+    /*
+        Print the stage two levels deep, one line per object:
+        name, position, scale, visibility, alpha.
+
+        Local patch:
+        Ruffle can already print the whole display list,
+        but only behind a Ctrl-Alt-F handler that needs a keyboard we do not have and a debug feature we do not ship
+        and the trait carrying it is not publicly re-exported, so a frontend cannot call it at all.
+
+        Two levels and one line each is what a bug report can carry,
+        and it answers the question a black screen actually poses:
+        is anything on stage, where is it, and is it visible?
+        
+        On Peggle (#100), it read "clip_game x=542 visible=false alpha=0.00"
+        next to a stage 542 wide, the game had built itself,
+        parked itself off screen and hidden everything,
+        waiting for a container callback that no one was making.
+    */
+    pub fn dump_stage_children(&mut self) {
+        self.mutate_with_update_context(|context| {
+            let stage = context.stage;
+            for child in stage.iter_render_list() {
+                Self::dump_one(child, 1);
+                if let Some(container) = child.as_container() {
+                    for grandchild in container.iter_render_list() {
+                        Self::dump_one(grandchild, 2);
+                    }
+                }
+            }
+        });
+    }
+
+    fn dump_one(obj: DisplayObject<'_>, depth: usize) {
+        println!(
+            "{}{} x={:.0} y={:.0} scale=({:.2},{:.2}) visible={} alpha={:.2}",
+            " ".repeat(depth * 2),
+            obj.name().map(|s| s.to_string()).unwrap_or_else(|| "(anon)".into()),
+            obj.x().to_pixels(),
+            obj.y().to_pixels(),
+            obj.scale_x().unit(),
+            obj.scale_y().unit(),
+            obj.visible(),
+            obj.alpha(),
+        );
+    }
+
+    /*
+        Print the movie's AVM1 variables, two levels deep, one line each.
+
+        Local patch, and a sibling to "dump_stage_children".
+        Ruffle owns a perfectly good "VariableDumper",
+        but it is wired to a Ctrl-Alt-V handler behind the "`avm_debug" feature:
+        a keyboard we do not have on a console, in a build we do not ship.
+        It also recurses without bound and prints whole object graphs,
+        which a 17 MB game turns into megabytes.
+
+        This one answers the question a stuck level actually poses
+        what does the game think its own state is, and answers it in a page.
+        
+        Primitives print their value:
+        movie clips print their frame and then one level of their own variables,
+        and no deeper.
+        That is enough to read a condition like "_root.enemy2.hp <= 0"
+        from the outside and see that the term is "undefined" rather than a number,
+        which no amount of staring at the screen will tell you.
+    */
+    pub fn dump_root_vars(&mut self) {
+        self.mutate_with_update_context(|context| {
+            let mut activation =
+                Activation::from_stub(context, ActivationIdentifier::root("[FlashNX var dump]"));
+            let Some(object) = activation.context.stage.root_clip().and_then(|root| root.object1())
+            else {
+                println!("root vars: no AVM1 root");
+                return;
+            };
+            println!("root vars: begin");
+            Self::dump_vars_of(object, "_root", true, &mut activation);
+            println!("root vars: end");
+        });
+    }
+
+    fn dump_vars_of<'gc>(object: Object<'gc>, path: &str, descend: bool, activation: &mut Activation<'_, 'gc>, ) {
+        for key in object.get_keys(activation, false) {
+            let Ok(value) = object.get(key, activation) else {
+                continue;
+            };
+            let child = match value {
+                Value::Object(o) => Some(o),
+                Value::MovieClip(mcr) => mcr.coerce_to_object(activation),
+                Value::Undefined => {
+                    println!("{path}.{key} = undefined");
+                    continue;
+                }
+                Value::Null => {
+                    println!("{path}.{key} = null");
+                    continue;
+                }
+                Value::Bool(b) => {
+                    println!("{path}.{key} = {b}");
+                    continue;
+                }
+                Value::Number(n) => {
+                    println!("{path}.{key} = {n}");
+                    continue;
+                }
+                Value::String(s) => {
+                    println!("{path}.{key} = \"{}\"", s.to_utf8_lossy());
+                    continue;
+                }
+            };
+            let Some(child) = child else { continue };
+            let Some(clip) = child.as_display_object().and_then(|display| display.as_movie_clip())
+            else {
+                continue;
+            };
+            println!(
+                "{path}.{key} = [clip frame {} of {} loaded, {} total]",
+                clip.current_frame(),
+                clip.frames_loaded(),
+                clip.header_frames(),
+            );
+            if descend {
+                Self::dump_vars_of(child, &format!("{path}.{key}"), false, activation);
+            }
+        }
+    }
+
+    /*
+        Push the movie's time origin forward by "d", hiding that interval from "getTimer()".
+
+        Local patch:
+        "getTimer()" (AVM1 and AVM2 alike) reads the wall clock since "start_time",
+        while frames advance on the "dt" handed to "tick()".
+        
+        Whenever the host stops ticking but the world keeps turning our pause menu,
+        the in-game software keyboard, the console's HOME menu,
+        the two clocks drift apart by the length of the interruption,
+        and a game that drives its simulation from "getTimer()"
+        deltas replays all of it on the first resumed frame
+        (seen on Zuma Highspeed Challenge:
+        a long pause came back as a stall followed by several levels' worth of progress).
+        Shifting the origin by the same amount keeps both clocks in step.
+    */
+    pub fn skip_paused_time(&mut self, d: Duration) {
+        self.start_time += d;
+    }
+
     pub fn tick(&mut self, dt: FloatDuration) {
         if !self.is_playing() {
             return;
+        }
+
+        FLASHNX_GC_US.store(0, Ordering::Relaxed);
+        #[cfg(feature = "flashnx_instr")]
+        {
+            use crate::avm1 as a;
+            a::FLASHNX_AVM1_ACTIONS.store(0, Ordering::Relaxed);
+            a::FLASHNX_AVM1_DECODE_TICKS.store(0, Ordering::Relaxed);
+            a::FLASHNX_AVM1_TOTAL_TICKS.store(0, Ordering::Relaxed);
+            a::FLASHNX_MCREF_CALLS.store(0, Ordering::Relaxed);
+            a::FLASHNX_MCREF_HITS.store(0, Ordering::Relaxed);
+            a::FLASHNX_MCREF_TICKS.store(0, Ordering::Relaxed);
         }
 
         self.frame_accumulator += dt;
@@ -554,6 +1013,9 @@ impl Player {
             }
         }
 
+        // publish how many SWF frames this tick actually ran, so the Switch frontend can tell a catch-up burst from a collector pause.
+        FLASHNX_FRAMES_RUN.store(frame, Ordering::Relaxed);
+
         // Now that we're done running code,
         // we can stop pretending that more time passed than actually did.
         // Note: update_timers(dt) doesn't need to see this either.
@@ -577,6 +1039,7 @@ impl Player {
                 .audio_skew_time(context.audio, cur_frame_offset)
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+        FLASHNX_FRAME_ACC_US.store((self.frame_accumulator.as_millis() * 1000.0).max(0.0) as u64, Ordering::Relaxed, );
 
         self.update_sockets();
         self.update_net_connections();
@@ -2038,10 +2501,37 @@ impl Player {
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
+            let timer = Instant::now();
             self.update(|context| {
                 let stage = context.stage;
                 stage.broadcast_render(context);
             });
+
+            /*
+                the "render" handlers are part of what the frame that asked for them ("stage.invalidate()") costs,
+                so they count in the timings "max_frames_per_tick" decides catch-up from.
+                
+                They ran after the frame's own timing was taken: added to it here.
+                Super Smash Flash 2 runs its whole engine in a "render" handler
+                (its "enterFrame" handler only calls "stage.invalidate()"):
+                ~10 ms of frame and ~33 ms of handler in a fight on the Switch,
+                measured as 10 ms, so 2 or 3 frames ran per tick.
+                
+                The handler runs once per render, not once per frame:
+                the extra frames moved its timelines on without the engine,
+                which itself advanced once per image drawn (~17 a second while the counter read 30),
+                and they cost a quarter of every tick.
+                Counted, the cost is over a frame's duration,
+                one frame runs per tick and every one of them is drawn and gets its "render" event,
+                which is what Flash Player does: it slows down, it does not skip images.
+                
+                Movies with no heavy "render" handler are not affected.
+            */
+            let elapsed = timer.elapsed().as_secs_f64() * 1000.0;
+            if RENDER_COST.load(Ordering::Relaxed) && let Some(last) = self.recent_run_frame_timings.back_mut()
+            {
+                *last += elapsed;
+            }
         }
 
         let mut background_color = Color::WHITE;
@@ -2058,7 +2548,7 @@ impl Player {
                 library: &gc_root.library,
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
-                use_bitmap_cache: true,
+                use_bitmap_cache: BITMAP_CACHE.load(std::sync::atomic::Ordering::Relaxed),
                 stage,
             };
 
@@ -2296,7 +2786,7 @@ impl Player {
                 external_interface,
                 start_time: this.start_time,
                 update_start: Instant::now(),
-                max_execution_duration: this.max_execution_duration,
+                max_execution_duration: &mut this.max_execution_duration,
                 focus_tracker: stage.focus_tracker(),
                 times_get_time_called: 0,
                 time_offset: &mut this.time_offset,
@@ -2355,6 +2845,49 @@ impl Player {
         self.debug_ui.borrow_mut()
     }
 
+    /*
+        Pays the collector's debt.
+        
+        Every collection goes through here or "collect_full",
+        which finalize released movie libraries ("finalize_released_libraries")
+        whenever the arena is fully marked:
+        a sweep must never follow a marking that skipped it.
+        
+        "cycle_debt" stops at the end of a cycle,
+        so a new cycle can only get marked in "mark_debt".
+        Returns the sounds of the libraries dropped.
+    */
+    fn collect_debt(&mut self) -> Vec<SoundHandle> {
+        use gc_arena::arena::CollectionPhase;
+        let mut arena = self.gc_arena.borrow_mut();
+        if arena.mark_debt().is_some() {
+            let sounds = finalize_released_libraries(&mut arena);
+            arena.cycle_debt();
+            sounds
+        } else {
+            if arena.collection_phase() == CollectionPhase::Sweeping {
+                arena.cycle_debt();
+            }
+            Vec::new()
+        }
+    }
+
+    // A whole collection (what "finish_cycle" did), finalized like "collect_debt".
+    fn collect_full(&mut self) -> Vec<SoundHandle> {
+        use gc_arena::arena::CollectionPhase;
+        let mut arena = self.gc_arena.borrow_mut();
+        /*
+            Marking cannot start mid-sweep: end the sweep first.
+            From Sweeping, "finish_cycle" stops at Sleeping, it does not start a new cycle.
+        */
+        if arena.collection_phase() == CollectionPhase::Sweeping {
+            arena.finish_cycle();
+        }
+        let sounds = finalize_released_libraries(&mut arena);
+        arena.finish_cycle();
+        sounds
+    }
+
     /// Update the current state of the player.
     ///
     /// The given function will be called with the current stage root, current
@@ -2382,7 +2915,86 @@ impl Player {
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
         // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        /*
+            Under BitmapData pressure,
+            complete a whole cycle rather than just paying down the incremental debt (see "bitmapdata_under_pressure").
+            
+            The full cycle costs real time,
+            which is why it is gated, but a stall beats an OOM abort,
+            and it only engages once a game is already holding hundreds of megabytes of collectable surfaces.
+            
+            Timed: the phase probe showed SWEEP frames costing 156 ms against 49 ms in SLEEP,
+            i.e. ~48% of Mario 63's castle wall clock.
+            
+            The phase is only ""correlated"" with the tick cost,
+            though, this measures the collector call itself,
+            so the sweep can be charged directly instead of inferred.
+        */
+        let gc_t0 = Instant::now();
+        let full_gc_requested = FULL_GC_REQUESTED.swap(false, Ordering::Relaxed);
+        let dropped_sounds;
+        if crate::bitmap::bitmap_data::bitmapdata_under_pressure() {
+            dropped_sounds = self.collect_full();
+        } else if full_gc_requested {
+            let before = self.gc_arena.borrow().metrics().total_allocation();
+            dropped_sounds = self.collect_full();
+            let after = self.gc_arena.borrow().metrics().total_allocation();
+            tracing::info!("System.gc(): full collection in {} ms, {} -> {} MB", gc_t0.elapsed().as_millis(), before / (1024 * 1024), after / (1024 * 1024));
+        } else {
+            /*
+                Past GC_TIGHT_BYTES of live arena, collect sooner and faster.
+                With gc-arena's default pacing,
+                the garbage waiting for a collection reaches about the size of the live heap
+                (sleep 0.5 of it, then the cycle itself allocates ~0.6 of it before it frees anything):
+                
+                Super Smash Flash 2's arena swung 300 -> 450 MB in late Classic levels,
+                on a heap that dies at 3.0 GB.
+                
+                Here it is ~0.6 of it, for ~1.6x the collector's time, only on such heaps.
+                Small heaps go the other way ("gc_pacing").
+            */
+            {
+                let arena = self.gc_arena.borrow();
+                let metrics = arena.metrics();
+                metrics.set_pacing(gc_pacing(metrics.total_gc_allocation(), FLASHNX_GC_LIVE.load(Ordering::Relaxed) as usize, ));
+            }
+            dropped_sounds = self.collect_debt();
+        }
+        for sound in dropped_sounds {
+            self.audio.unregister_sound(sound);
+        }
+        /*
+            ACCUMULATE, never store:
+            "update()" runs several times per host frame (run_frame, update_timers, StreamManager, ...)
+            and each one steps the collector.
+            Storing published only the last call,
+            which is the one that finds no debt left to pay and therefore reads ~0
+            the reason the first capture showed gcUs at zero on 292 ms frames.
+            
+            Reset at the top of "tick".
+        */
+        FLASHNX_GC_US.fetch_add(gc_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        /*
+            Publish where the collector stopped, and how much the arena is holding.
+            Read once per host frame by the "SLOW" line.
+        */
+        {
+            use gc_arena::arena::CollectionPhase;
+            let arena = self.gc_arena.borrow();
+            let phase = match arena.collection_phase() {
+                CollectionPhase::Sleeping => 0,
+                CollectionPhase::Marking => 1,
+                CollectionPhase::Marked => 2,
+                CollectionPhase::Sweeping => 3,
+            };
+            // A cycle has just finished: what is left is what was alive.
+            if phase == 0 && FLASHNX_GC_PHASE.load(Ordering::Relaxed) != 0 {
+                FLASHNX_GC_LIVE.store(arena.metrics().total_gc_allocation() as u64, Ordering::Relaxed, );
+            }
+            FLASHNX_GC_PHASE.store(phase, Ordering::Relaxed);
+            FLASHNX_GC_ALLOC.store(arena.metrics().total_allocation() as u64, Ordering::Relaxed);
+        }
 
         rval
     }
@@ -2956,6 +3568,9 @@ impl PlayerBuilder {
     pub fn build(self) -> Arc<Mutex<Player>> {
         use crate::backend::*;
         use ruffle_video::null;
+        // A new arena, nothing measured about it yet.
+        FLASHNX_GC_LIVE.store(0, Ordering::Relaxed);
+        FLASHNX_GC_PHASE.store(0, Ordering::Relaxed);
         let audio = self
             .audio
             .unwrap_or_else(|| Box::new(audio::NullAudioBackend::new()));
@@ -3171,6 +3786,34 @@ pub struct DragObject<'gc> {
     /// The bounding rectangle where the clip will be maintained.
     #[collect(require_static)]
     pub constraint: Rectangle<Twips>,
+}
+
+/*
+    Marks the arena to its end and runs "Library::finalize_released" passes,
+    marking again after each pass that resurrected a library,
+    until one does not (that one drops the unused libraries).
+    Must run before every sweep. Returns the sounds of the libraries dropped.
+*/
+fn finalize_released_libraries(arena: &mut GcArena) -> Vec<SoundHandle> {
+    let mut sounds = Vec::new();
+    loop {
+        // Not sweeping ("collect_debt", "collect_full"), so this marks to the end and stops there.
+        let Some(marked) = arena.finish_marking() else {
+            unreachable!("finalize_released_libraries while sweeping");
+        };
+        let (again, dropped) = marked.finalize(finalize_pass);
+        sounds.extend(dropped);
+        if !again {
+            return sounds;
+        }
+    }
+}
+
+fn finalize_pass<'gc>(fc: &'gc gc_arena::Finalization<'gc>, root: &'gc GcRoot<'gc>, ) -> (bool, Vec<SoundHandle>) {
+    if !root.data.borrow().library.has_released() {
+        return (false, Vec::new());
+    }
+    root.data.borrow_mut(fc).library.finalize_released(fc)
 }
 
 fn run_mouse_pick<'gc>(

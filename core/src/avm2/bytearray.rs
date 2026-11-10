@@ -3,6 +3,7 @@ use crate::avm2::Error;
 use crate::avm2::error::{make_error_2006, make_error_2030};
 use crate::context::UpdateContext;
 use crate::string::{FromWStr, WStr};
+use crate::tag_utils::SharedBytes;
 use flate2::Compression;
 use flate2::read::*;
 use gc_arena::Collect;
@@ -78,8 +79,14 @@ pub enum ObjectEncoding {
 
 #[derive(Clone, Debug)]
 pub struct ByteArrayStorage {
-    /// Underlying ByteArray
+    /// Underlying ByteArray (empty while "shared" holds the bytes)
     bytes: Vec<u8>,
+
+    /*
+		While set, the bytes are this range of a buffer shared with another ByteArray or a loaded movie ("SharedBytes").
+		Every write takes a private copy first ("unshare").
+	*/
+    shared: Option<SharedBytes>,
 
     /// The current position to read/write from
     position: Cell<usize>,
@@ -96,6 +103,7 @@ impl ByteArrayStorage {
     pub fn new(context: &mut UpdateContext<'_>) -> ByteArrayStorage {
         ByteArrayStorage {
             bytes: Vec::new(),
+            shared: None,
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
@@ -106,10 +114,45 @@ impl ByteArrayStorage {
     pub fn from_vec(context: &mut UpdateContext<'_>, bytes: Vec<u8>) -> ByteArrayStorage {
         ByteArrayStorage {
             bytes,
+            shared: None,
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
         }
+    }
+
+    // the bytes, shared or not.
+    #[inline]
+    fn data(&self) -> &[u8] {
+        match &self.shared {
+            Some(shared) => shared.as_slice(),
+            None => &self.bytes,
+        }
+    }
+
+    // a write is coming: shared bytes become a private copy first. Every writer below goes through here.
+    #[inline]
+    fn unshare(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            self.bytes = shared.as_slice().to_vec();
+        }
+    }
+
+    // these bytes as a shared range, without a copy: this ByteArray keeps them too, and copies them before its next write ("SharedBytes").
+    pub fn share(&mut self) -> SharedBytes {
+        if let Some(shared) = &self.shared {
+            return shared.clone();
+        }
+        let shared = SharedBytes::new(std::mem::take(&mut self.bytes));
+        self.shared = Some(shared.clone());
+        shared
+    }
+
+    // what "write_bytes(bytes)" does to an empty ByteArray, without copying them.
+    pub fn set_shared(&mut self, bytes: SharedBytes) {
+        self.bytes = Vec::new();
+        self.position.set(bytes.len());
+        self.shared = Some(bytes);
     }
 
     /// Write bytes at the next position in the ByteArray, growing if needed.
@@ -135,9 +178,11 @@ impl ByteArrayStorage {
         Ok(bytes)
     }
 
-    /// Same as `read_bytes`, but:
-    /// - cuts the result at the first null byte to recreate a bug in FP
-    /// - strips off an optional UTF8 BOM at the beginning
+	/*
+		Same as "read_bytes", but:
+		- cuts the result at the first null byte to recreate a bug in FP
+		- strips off an optional UTF8 BOM at the beginning
+	*/
     pub fn read_utf_bytes(&self, amnt: usize) -> Result<&[u8], ByteArrayError> {
         let mut bytes = self.read_bytes(amnt)?;
         if let Some(without_bom) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
@@ -152,7 +197,7 @@ impl ByteArrayStorage {
     /// Reads any amount of bytes at any offset in the ByteArray
     #[inline]
     pub fn read_at(&self, amnt: usize, offset: usize) -> Result<&[u8], ByteArrayError> {
-        self.bytes
+        self.data()
             .get(offset..)
             .and_then(|bytes| bytes.get(..amnt))
             .ok_or(ByteArrayError::EndOfFile)
@@ -170,6 +215,7 @@ impl ByteArrayStorage {
         if self.len() < new_len {
             self.set_length(new_len);
         }
+        self.unshare();
         self.bytes
             .get_mut(offset..new_len)
             .expect("ByteArray write out of bounds")
@@ -180,6 +226,7 @@ impl ByteArrayStorage {
     /// Write bytes at any offset in the ByteArray
     /// Will return an error if the new buffer does not fit the ByteArray
     pub fn write_at_nongrowing(&mut self, buf: &[u8], offset: usize) -> Result<(), ByteArrayError> {
+        self.unshare();
         self.bytes
             .get_mut(offset..)
             .and_then(|bytes| bytes.get_mut(..buf.len()))
@@ -213,6 +260,7 @@ impl ByteArrayStorage {
             self.set_length(new_len);
         }
 
+        self.unshare();
         self.bytes.copy_within(start..end, offset);
         Ok(())
     }
@@ -224,15 +272,15 @@ impl ByteArrayStorage {
             CompressionAlgorithm::Zlib => {
                 // Note: some content is sensitive to compression type
                 // (as it's visible in the header)
-                let mut encoder = ZlibEncoder::new(&*self.bytes, Compression::best());
+                let mut encoder = ZlibEncoder::new(self.data(), Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             CompressionAlgorithm::Deflate => {
-                let mut encoder = DeflateEncoder::new(&*self.bytes, Compression::best());
+                let mut encoder = DeflateEncoder::new(self.data(), Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             #[cfg(feature = "lzma")]
-            CompressionAlgorithm::Lzma => lzma_rs::lzma_compress(&mut &*self.bytes, &mut buffer)
+            CompressionAlgorithm::Lzma => lzma_rs::lzma_compress(&mut self.data(), &mut buffer)
                 .err()
                 .map(|e| e.into()),
             #[cfg(not(feature = "lzma"))]
@@ -251,15 +299,15 @@ impl ByteArrayStorage {
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
-                let mut decoder = ZlibDecoder::new(&*self.bytes);
+                let mut decoder = ZlibDecoder::new(self.data());
                 decoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             CompressionAlgorithm::Deflate => {
-                let mut decoder = DeflateDecoder::new(&*self.bytes);
+                let mut decoder = DeflateDecoder::new(self.data());
                 decoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             #[cfg(feature = "lzma")]
-            CompressionAlgorithm::Lzma => lzma_rs::lzma_decompress(&mut &*self.bytes, &mut buffer)
+            CompressionAlgorithm::Lzma => lzma_rs::lzma_decompress(&mut self.data(), &mut buffer)
                 .err()
                 .map(|e| e.into()),
             #[cfg(not(feature = "lzma"))]
@@ -299,6 +347,7 @@ impl ByteArrayStorage {
 
     #[inline]
     pub fn clear(&mut self) {
+        self.shared = None;
         self.bytes.clear();
         self.position.set(0)
     }
@@ -310,15 +359,24 @@ impl ByteArrayStorage {
 
     #[inline]
     pub fn set_length(&mut self, new_len: usize) {
+        // Shortening shared bytes only shortens the range.
+        if let Some(shared) = &self.shared && new_len <= shared.len()
+        {
+            self.shared = Some(shared.sub(0, new_len));
+            self.position.set(self.position().min(new_len));
+            return;
+        }
+        self.unshare();
         self.bytes.resize(new_len, 0);
         self.position.set(self.position().min(new_len));
     }
 
     pub fn get(&self, pos: usize) -> Option<u8> {
-        self.bytes.get(pos).copied()
+        self.data().get(pos).copied()
     }
 
     pub fn set(&mut self, item: usize, value: u8) {
+        self.unshare();
         if self.len() < (item + 1) {
             self.bytes.resize(item + 1, 0)
         }
@@ -330,15 +388,21 @@ impl ByteArrayStorage {
     /// method sets the bytearray's `position` to 0.
     pub fn swap_storage_with(&mut self, new_data: &mut Vec<u8>) {
         self.position.set(0);
+        // "new_data" receives the old bytes as its own.
+        self.unshare();
         std::mem::swap(&mut self.bytes, new_data);
     }
 
     /// Write a single byte at any offset in the bytearray, panicking if out of bounds.
     pub fn set_nongrowing(&mut self, item: usize, value: u8) {
+        self.unshare();
         self.bytes[item] = value;
     }
 
     pub fn delete(&mut self, item: usize) {
+        if item < self.len() {
+            self.unshare();
+        }
         if let Some(i) = self.bytes.get_mut(item) {
             *i = 0;
         }
@@ -346,17 +410,18 @@ impl ByteArrayStorage {
 
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.data()
     }
 
     #[inline]
     pub fn bytes_mut(&mut self) -> &mut [u8] {
+        self.unshare();
         &mut self.bytes
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.data().len()
     }
 
     #[inline]

@@ -6,6 +6,72 @@ use crate::{
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_macros::istr;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/*
+	Reuse a clip's "MovieClipReference" while its path is unchanged.
+	Every time a MovieClip lands on the AVM1 stack (a register or "this" pushed, a GetMember or GetVariable result),
+	"try_from_stage_object" used to rebuild the whole dotted path string (one allocation per level plus a "format!" for "_levelN"),
+	re-split it into segments, and allocate a new reference: garbage for the GC every time.
+	
+	Upstream master still does.
+	On Super Mario 63 Push measured 897 ns per action and GetMember 2.1 us, and the cache took world 8 from 57 to 37 ms a frame.
+	Always on, FlashNX turns it off only for an "mcref.off" marker on the SD card, to compare a game without it.
+*/
+static FLASHNX_MCREF_CACHE: AtomicBool = AtomicBool::new(true);
+
+pub fn flashnx_set_mcref_cache(on: bool) {
+    FLASHNX_MCREF_CACHE.store(on, Ordering::Relaxed);
+}
+
+pub fn flashnx_mcref_cache_on() -> bool {
+    FLASHNX_MCREF_CACHE.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_MCREF_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_MCREF_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_MCREF_TICKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/*
+	A fingerprint of exactly what "DisplayObject::path" would build: the name of every link up to the root, then the root's level.
+	Reads names, allocates nothing. 2 different paths colliding on 64 bits is not a realistic risk.
+*/
+fn flashnx_path_signature(object: DisplayObject<'_>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    let mut current = object;
+    loop {
+        match current.avm1_parent() {
+            Some(parent) => {
+                match current.name() {
+                    Some(name) => {
+                        // Length first, so "ab"+"c" and "a"+"bc" differ.
+                        mix(name.len() as u64 + 1);
+                        for unit in name.iter() {
+                            mix(unit as u64);
+                        }
+                    }
+                    None => mix(0),
+                }
+                current = parent;
+            }
+            None => {
+                mix(0xFFFF_0000_0000 | (current.depth() as u32 as u64));
+                break;
+            }
+        }
+    }
+    h
+}
 
 #[derive(Clone, Debug, Collect)]
 #[collect(no_drop)]
@@ -73,9 +139,58 @@ impl<'gc> MovieClipReference<'gc> {
     ) -> Option<Self> {
         // We can't use as_display_object here as we explicitly don't want to convert `SuperObjects`
         let display_object = object.as_display_object_no_super()?;
-        let (path, cached) = if let DisplayObject::MovieClip(mc) = display_object {
-            (mc.path(), display_object.object1()?)
-        } else if activation.swf_version() <= 5 {
+
+		/*
+			A MovieClip whose path has not changed since its reference was built gets that same reference back (see FLASHNX_MCREF_CACHE).
+			It is the same value a fresh build would produce: same path, and a weak cache of this very clip's object (set once, never replaced).
+			Sharing it is invisible: "Value" compares references by path, never by pointer.
+		*/
+        if let DisplayObject::MovieClip(mc) = display_object {
+            #[cfg(feature = "flashnx_instr")]
+            let t0 = super::activation::flashnx_ticks();
+            let cached = display_object.object1()?;
+            let cache_on = FLASHNX_MCREF_CACHE.load(Ordering::Relaxed);
+            let sig = if cache_on { flashnx_path_signature(display_object) } else { 0 };
+            /*
+				Except a reference that has dropped its object:
+				Resolving it while the clip was off the stage made it walk its path by name from then on, where a fresh one would still go straight to the clip.
+			*/
+            let hit = if cache_on {
+                mc.flashnx_cached_ref(sig).filter(|reference| reference.0.cached_object.get().is_some())
+            } else {
+                None
+            };
+            let reference = match hit {
+                Some(reference) => reference,
+                None => {
+                    let reference = Self(Gc::new(
+                        activation.gc(),
+                        MovieClipReferenceData {
+                            path: MovieClipPath::new_from_path(activation.gc(), mc.path()),
+                            cached_object: Some(cached.as_weak()).into(),
+                        },
+                    ));
+                    if cache_on {
+                        mc.flashnx_set_cached_ref(activation.gc(), reference, sig);
+                    }
+                    reference
+                }
+            };
+            #[cfg(feature = "flashnx_instr")]
+            {
+                FLASHNX_MCREF_CALLS.fetch_add(1, Ordering::Relaxed);
+                if hit.is_some() {
+                    FLASHNX_MCREF_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                FLASHNX_MCREF_TICKS.fetch_add(
+                    super::activation::flashnx_ticks().wrapping_sub(t0),
+                    Ordering::Relaxed,
+                );
+            }
+            return Some(reference);
+        }
+
+        let (path, cached) = if activation.swf_version() <= 5 {
             let display_object = Self::process_swf5_references(activation, display_object)?;
 
             (display_object.path(), display_object.object1()?)

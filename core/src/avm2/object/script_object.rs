@@ -66,7 +66,9 @@ pub struct ScriptObjectData<'gc> {
     slots: Box<[Lock<Value<'gc>>]>,
 
     /// Methods stored on this object.
-    bound_methods: RefLock<Vec<Option<FunctionObject<'gc>>>>,
+
+    // Allocated with the first one: most objects never bind a method, and the empty "Vec" cost every AS3 object 24 bytes (see "DynamicMap" for the same reason).
+    bound_methods: RefLock<Option<Box<Vec<Option<FunctionObject<'gc>>>>>>,
 
     /// Implicit prototype of this script object.
     proto: Lock<Option<Object<'gc>>>,
@@ -76,6 +78,11 @@ pub struct ScriptObjectData<'gc> {
 
     /// The table used for non-dynamic property lookups.
     vtable: Lock<VTable<'gc>>,
+
+    // Counts this object under its class (census: line).
+    #[cfg(feature = "flashnx_census")]
+    #[collect(require_static)]
+    _census: crate::flashnx_census::ObjectGuard,
 }
 
 impl<'gc> TObject<'gc> for ScriptObject<'gc> {
@@ -130,6 +137,14 @@ impl<'gc> ScriptObject<'gc> {
 }
 
 impl<'gc> ScriptObjectData<'gc> {
+    // where "slots" sits in every AS3 object (each object type starts with this struct), for the JIT's inline "getslot".
+    pub const FLASHNX_SLOTS_OFFSET: usize = std::mem::offset_of!(ScriptObjectData<'gc>, slots);
+
+    // the slots as the JIT will find them in memory (pointer, length).
+    pub fn flashnx_slots(&self) -> (usize, usize) {
+        (self.slots.as_ptr() as usize, self.slots.len())
+    }
+
     /// Create new object data of a given class.
     /// This is a low-level function used to implement things like object allocators.
     pub fn new(instance_of: ClassObject<'gc>) -> Self {
@@ -162,8 +177,12 @@ impl<'gc> ScriptObjectData<'gc> {
         ScriptObjectData {
             values: RefLock::new(Default::default()),
             slots,
-            bound_methods: RefLock::new(Vec::new()),
+            bound_methods: RefLock::new(None),
             proto: Lock::new(proto),
+            #[cfg(feature = "flashnx_census")]
+            _census: crate::flashnx_census::ObjectGuard::new(instance_class.as_ptr() as usize, || {
+                instance_class.name().to_qualified_name_no_mc().to_string()
+            }),
             instance_class,
             vtable: Lock::new(vtable),
         }
@@ -186,15 +205,19 @@ impl<'gc> ScriptObjectWrapper<'gc> {
         unlock!(Gc::write(mc, self.0), ScriptObjectData, values).borrow_mut()
     }
 
-    fn bound_methods(&self) -> Ref<'_, Vec<Option<FunctionObject<'gc>>>> {
-        self.0.bound_methods.borrow()
+    fn bound_methods(&self) -> Ref<'_, [Option<FunctionObject<'gc>>]> {
+        Ref::map(self.0.bound_methods.borrow(), |methods| {
+            methods.as_deref().map_or(&[][..], |methods| methods.as_slice())
+        })
     }
 
     fn bound_methods_mut(
         &self,
         mc: &Mutation<'gc>,
     ) -> RefMut<'_, Vec<Option<FunctionObject<'gc>>>> {
-        unlock!(Gc::write(mc, self.0), ScriptObjectData, bound_methods).borrow_mut()
+        RefMut::map(
+            unlock!(Gc::write(mc, self.0), ScriptObjectData, bound_methods).borrow_mut(), |methods| &mut **methods.get_or_insert_with(Default::default),
+        )
     }
 
     pub fn get_property_local(

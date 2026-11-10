@@ -167,6 +167,25 @@ pub fn join<'gc>(
             separator.coerce_to_string(activation)?
         };
 
+        /*
+			no element, or one:
+			no separator ever goes in, so the answer is that element's own string, without the list, the joined copy and a second string the general case builds.
+			An obfuscator's "x - [y]" turns "[y]" into a number through "join" (3D Mario Racing, ~4 500 times a frame at 2.6 us each).
+		*/
+        if array.length() <= 1 {
+            return Ok(match array.iter().next() {
+                None => istr!("").into(),
+                Some(item) => {
+                    let item = resolve_array_hole(activation, this, 0, item)?;
+                    if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
+                        istr!("").into()
+                    } else {
+                        item.coerce_to_string(activation)?.into()
+                    }
+                }
+            });
+        }
+
         let mut accum = Vec::with_capacity(array.length());
 
         for (i, item) in array.iter().enumerate() {
@@ -797,6 +816,43 @@ where
     Ok(!options.contains(SortOptions::UNIQUE_SORT) || unique_sort_satisfied)
 }
 
+/*
+	"sort_inner", with each value's index in the source array handed to "sort_func" beside it, so a comparison can remember something per element (sort_on's field values).
+	Everything else is sort_inner's.
+*/
+fn sort_inner_indexed<'a, 'gc, C>(activation: &mut Activation<'a, 'gc>, values: &mut [(usize, Value<'gc>)], options: SortOptions, mut sort_func: C, ) -> Result<bool, Error<'gc>>
+where C: FnMut(&mut Activation<'a, 'gc>, (usize, Value<'gc>), (usize, Value<'gc>)) -> Result<Ordering, Error<'gc>>,
+{
+    let mut unique_sort_satisfied = true;
+
+    qsort(values, &mut |(ia, a), (ib, b)| {
+        let unresolved_a = *a;
+        let unresolved_b = *b;
+
+        if matches!(unresolved_a, Value::Undefined) && matches!(unresolved_b, Value::Undefined) {
+            unique_sort_satisfied = false;
+            return Ok(Ordering::Equal);
+        } else if matches!(unresolved_a, Value::Undefined) {
+            return Ok(Ordering::Greater);
+        } else if matches!(unresolved_b, Value::Undefined) {
+            return Ok(Ordering::Less);
+        }
+
+        sort_func(activation, (*ia, *a), (*ib, *b)).map(|cmp| {
+            if cmp == Ordering::Equal {
+                unique_sort_satisfied = false;
+                Ordering::Equal
+            } else if options.contains(SortOptions::DESCENDING) {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        })
+    })?;
+
+    Ok(!options.contains(SortOptions::UNIQUE_SORT) || unique_sort_satisfied)
+}
+
 /// A port of the avmplus QuickSort implementation.
 ///
 /// This differs from Rust's `slice::sort` in the following way:
@@ -1228,6 +1284,57 @@ pub fn sort_on<'gc>(
             field_names.len(),
             options.last().cloned().unwrap_or_else(SortOptions::empty),
         );
+    }
+
+    /*
+		One field, as avmplus does it (ArrayClass.cpp, "One field value - pre-get our field values so we can just do a regular sort"):
+		each element's field is read once, not twice per comparison.
+		A 3D game sorting its ~1 500 triangles by depth every frame spent 8 ms a frame looking the same field up ~33 000 times (3D Mario Racing).
+		Read on first use rather than up front, so a null element raises its error at the same comparison as below; the comparison itself is the one below, field for field.
+	*/
+    if field_names.len() == 1 {
+        let field_name = field_names[0];
+        let field_options = options[0];
+        let mut fields: Vec<Option<Value<'gc>>> = vec![None; values.len()];
+        let unique_satisfied = sort_inner_indexed(activation, &mut values, first_option, |activation, (ia, a), (ib, b)| {
+                let a_field = match fields[ia] {
+                    Some(v) => v,
+                    None => {
+                        let a_object = a.null_check(activation, None)?;
+                        let v = a_object.get_public_property(field_name, activation)?;
+                        fields[ia] = Some(v);
+                        v
+                    }
+                };
+                let b_field = match fields[ib] {
+                    Some(v) => v,
+                    None => {
+                        let b_object = b.null_check(activation, None)?;
+                        let v = b_object.get_public_property(field_name, activation)?;
+                        fields[ib] = Some(v);
+                        v
+                    }
+                };
+
+                let ord = if field_options.contains(SortOptions::NUMERIC) {
+                    compare_numeric_slow(activation, a_field, b_field)?
+                } else if field_options.contains(SortOptions::CASE_INSENSITIVE) {
+                    compare_string_case_insensitive(activation, a_field, b_field)?
+                } else {
+                    compare_string_case_sensitive(activation, a_field, b_field)?
+                };
+
+                if matches!(ord, Ordering::Equal) {
+                    Ok(Ordering::Equal)
+                } else if field_options.contains(SortOptions::DESCENDING) {
+                    Ok(ord.reverse())
+                } else {
+                    Ok(ord)
+                }
+            },
+        )?;
+
+        return sort_postprocess(activation, this, first_option, unique_satisfied, values);
     }
 
     let unique_satisfied = sort_inner(

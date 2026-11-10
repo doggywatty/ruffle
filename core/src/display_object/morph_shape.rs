@@ -40,6 +40,11 @@ pub struct MorphShapeData<'gc> {
 }
 
 impl<'gc> MorphShape<'gc> {
+    // see "Character::has_live_instances".
+    pub fn shared_alive(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        !Gc::is_dead(fc, self.0.shared.get())
+    }
+
     pub fn from_swf_tag(
         gc_context: &Mutation<'gc>,
         tag: swf::DefineMorphShape,

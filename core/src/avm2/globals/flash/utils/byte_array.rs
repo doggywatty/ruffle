@@ -76,6 +76,30 @@ pub fn write_bytes<'gc>(
     let length = args.get_u32(2) as usize;
 
     if !Object::ptr_eq(this, bytearray) {
+        /*
+            A big range of another ByteArray written into an empty one is shared rather than copied (SharedBytes):
+            the first write to either copies it then.
+            Super Smash Flash 2 copies the SWF out of every DAT file it loads this way.
+        */
+        const SHARE_MIN: usize = 64 * 1024;
+        let this_empty = this.as_bytearray().is_some_and(|b| b.len() == 0 && b.position() == 0);
+        if this_empty {
+            let mut src = bytearray.as_bytearray_mut().expect("Parameter must be a bytearray");
+            let amnt = if length != 0 {
+                length
+            } else {
+                src.len().saturating_sub(offset)
+            };
+            if amnt >= SHARE_MIN && offset.checked_add(amnt).is_some_and(|end| end <= src.len()) {
+                let shared = src.share().sub(offset, offset + amnt);
+                drop(src);
+                if let Some(mut dst) = this.as_bytearray_mut() {
+                    dst.set_shared(shared);
+                }
+                return Ok(Value::Undefined);
+            }
+        }
+
         // The ByteArray we are reading from is different than the ByteArray we are writing to,
         // so we are allowed to borrow both at the same time without worrying about a panic
 
@@ -739,11 +763,10 @@ pub fn compress<'gc>(
             Ok(algorithm) => algorithm,
             Err(_) => return Err(make_error_2058(activation)),
         };
-        let buffer = bytearray.compress(algorithm);
-        bytearray.clear();
-        bytearray
-            .write_bytes(&buffer)
-            .map_err(|e| e.to_avm(activation))?;
+        let mut buffer = bytearray.compress(algorithm);
+        // Take the result as the storage (see "uncompress").
+        buffer.shrink_to_fit();
+        bytearray.swap_storage_with(&mut buffer);
         bytearray.set_position(bytearray.len());
     }
 
@@ -763,14 +786,21 @@ pub fn uncompress<'gc>(
             Ok(algorithm) => algorithm,
             Err(_) => return Err(make_error_2058(activation)),
         };
-        let buffer = match bytearray.decompress(algorithm) {
+        let mut buffer = match bytearray.decompress(algorithm) {
             Some(buffer) => buffer,
             None => return Err(make_error_2058(activation)),
         };
-        bytearray.clear();
-        bytearray
-            .write_bytes(&buffer)
-            .map_err(|e| e.to_avm(activation))?;
+        
+        /*
+            The decompressed bytes BECOME the storage, at their exact size.
+            
+            Clearing the old storage and writing them back kept its capacity and grew it by doubling from there:
+            a game file that barely compresses (Super Smash Flash 2's DAT files, 126 MB -> 136 MB)
+            ended up holding ~1.85x its size, 341 MB of ByteArrays for ~184 MB of data in a heap profile.
+            "read_to_end" leaves slack of its own, hence the shrink.
+        */
+        buffer.shrink_to_fit();
+        bytearray.swap_storage_with(&mut buffer);
         bytearray.set_position(0);
     }
 

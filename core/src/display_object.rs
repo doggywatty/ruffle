@@ -32,6 +32,12 @@ mod avm1_button;
 mod avm2_button;
 mod bitmap;
 mod container;
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) use container::{
+    FLASHNX_GETNAME_CALLS, FLASHNX_GETNAME_SCANNED, FLASHNX_GETNAME_TICKS,
+};
+
 mod edit_text;
 mod graphic;
 mod interactive;
@@ -52,13 +58,22 @@ pub use avm1_button::{Avm1Button, ButtonState, ButtonTracking};
 pub use avm2_button::Avm2Button;
 pub use bitmap::{Bitmap, BitmapClass};
 #[allow(unused)]
+
 pub use edit_text::LayoutDebugBoxesFlag;
 pub use edit_text::{AutoSizeMode, EditText, TextSelection};
 pub use graphic::Graphic;
+pub use graphic::set_lazy_shapes;
 pub use interactive::{Avm2MousePick, InteractiveObject, TInteractiveObject};
 pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{MovieClip, MovieClipHandle, MovieClipWeak, Scene};
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) use movie_clip::FLASHNX_GOTO;
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) use movie_clip::flashnx_emptied_take;
+
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
 use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
@@ -257,6 +272,10 @@ pub enum RenderMask<'gc> {
 // Ensure this always has the same alignment as its subclasses (needed for `Gc` casts).
 #[repr(align(8))]
 pub struct DisplayObjectBase<'gc> {
+    // Counts live display objects ("census:" line).
+    #[cfg(feature = "flashnx_census")]
+    #[collect(require_static)]
+    _census: crate::flashnx_census::DisplayGuard,
     cell: RefCell<DisplayObjectBaseMut>,
     parent: Lock<Option<DisplayObject<'gc>>>,
     place_frame: Cell<u16>,
@@ -332,6 +351,8 @@ struct DisplayObjectBaseMut {
 impl Default for DisplayObjectBase<'_> {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "flashnx_census")]
+            _census: Default::default(),
             cell: RefCell::new(DisplayObjectBaseMut {
                 filters: Default::default(),
                 blend_shader: None,
@@ -683,6 +704,24 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::SKIP_NEXT_ENTER_FRAME, skip);
     }
 
+    // see "DisplayObjectFlags::LIFECYCLE_DIRTY".
+    pub fn lifecycle_dirty(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::LIFECYCLE_DIRTY)
+    }
+
+    pub fn set_lifecycle_dirty(&self, value: bool) {
+        self.set_flag(DisplayObjectFlags::LIFECYCLE_DIRTY, value);
+    }
+
+    // see "DisplayObjectFlags::ENTER_QUIET".
+    pub fn enter_quiet(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::ENTER_QUIET)
+    }
+
+    pub fn set_enter_quiet(&self, value: bool) {
+        self.set_flag(DisplayObjectFlags::ENTER_QUIET, value);
+    }
+
     fn set_avm1_removed(&self, value: bool) {
         self.set_flag(DisplayObjectFlags::AVM1_REMOVED, value);
     }
@@ -931,6 +970,238 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+/*
+    flag "obj" and every ancestor up to the top of its display tree as holding work for the next inner goto (see "run_inner_goto_frame").
+    The flag on the top lets a goto skip a whole orphan tree,
+    the flags below it let it skip the unchanged subtrees of the stage ("skipping_clean_subtrees").
+    A walk up the parent chain, a few pointer reads and flag writes.
+*/
+pub fn mark_lifecycle_dirty<'gc>(obj: DisplayObject<'gc>) {
+    let mut top = obj;
+    top.base().set_lifecycle_dirty(true);
+    // Whatever gives a goto work gives the next enter_frame a visit too.
+    top.base().set_enter_quiet(false);
+    while let Some(parent) = top.parent() {
+        top = parent;
+        top.base().set_lifecycle_dirty(true);
+        top.base().set_enter_quiet(false);
+    }
+    if top.as_stage().is_none() {
+        bump_orphan_mark_epoch();
+        queue_dirty_orphan(top);
+    }
+}
+
+thread_local! {
+    /*
+        Addresses of the tops of non-stage trees (orphans) marked dirty since an inner goto last collected them,
+        with a set to keep each address once.
+        Addresses, not references:
+        the marks happen with no "UpdateContext" at hand,
+        and "OrphanManager::resolve_dirty" turns them back into objects through the weak references it already keeps.
+
+        Without this,
+        every inner goto iterated the whole orphan list to find the few dirty ones:
+        ~800 weak references, twice per goto, ~100 gotos per frame in a Super Smash Flash 2 fight
+        ("nextFrame" measured at 74-131 us a call, ~9 ms of a fight frame).
+    */
+    static DIRTY_ORPHANS: RefCell<(Vec<usize>, fnv::FnvHashSet<usize>)> = RefCell::new((Vec::new(), fnv::FnvHashSet::default()));
+}
+
+// Queue a parentless, non-stage object that is dirty (see above).
+#[inline]
+pub fn queue_dirty_orphan(obj: DisplayObject<'_>) {
+    let addr = obj.as_ptr() as usize;
+    DIRTY_ORPHANS.with(|q| {
+        if let Ok(mut q) = q.try_borrow_mut() {
+            if q.1.insert(addr) {
+                q.0.push(addr);
+            }
+        }
+    });
+}
+
+// Everything queued since the last call, in queuing order.
+pub fn take_dirty_orphans() -> Vec<usize> {
+    DIRTY_ORPHANS.with(|q| {
+        let mut q = q.borrow_mut();
+        q.1.clear();
+        std::mem::take(&mut q.0)
+    })
+}
+
+/*
+    True while an inner goto walks the display lists.
+    Then "construct_frame" and "run_frame_scripts" pass over every child whose subtree is clean:
+    nothing in it changed frame, was added, queued a goto or a frame script since its last frame-script pass ("mark_lifecycle_dirty"),
+    and that pass left it fully constructed with no frame script outstanding ("settle_lifecycle_dirty").
+    On such a subtree both walks are no-ops.
+
+    Super Smash Flash 2 steps every clip of its stage itself,
+    every tick, with "nextFrame/gotoAndStop":
+    
+    50 to 80 inner gotos a frame in a fight, each of which walked the whole stage twice.
+    That was 15.8 % of the frame of a slow level (sampling profile).
+    
+    ruffle#23876 proposes the same idea ("a fully constructed flag") and ruffle#24509 reports the same wall.
+*/
+static SKIP_CLEAN_SUBTREES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Kill switch for the above ("stageskip.off" marker on the SD card).
+static STAGE_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+static SUBTREES_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_stage_skip(enabled: bool) {
+    STAGE_SKIP.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn skipping_clean_subtrees() -> bool {
+    SKIP_CLEAN_SUBTREES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Turns skipping on (if allowed) or off, returning the previous state so a nested inner goto can restore it.
+pub fn set_skipping_clean_subtrees(on: bool) -> bool {
+    let on = on && STAGE_SKIP.load(std::sync::atomic::Ordering::Relaxed);
+    SKIP_CLEAN_SUBTREES.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+// Whether a walk may pass over "child" (and count it).
+#[inline]
+pub fn skip_clean_child(child: DisplayObject<'_>) -> bool {
+    if skipping_clean_subtrees() && !child.base().lifecycle_dirty() {
+        SUBTREES_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+// Subtrees passed over since the last call.
+pub fn take_subtrees_skipped() -> u64 {
+    SUBTREES_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/*
+    Full frames pass over unchanged subtrees too:
+    quiet ones in "enter_frame" ("ENTER_QUIET"),
+    clean ones in "construct_frame" and "run_frame_scripts" (the inner gotos' skip, see "run_all_phases_avm2").
+
+    Every frame walked the whole display list three times,
+    and every visit is pointer chasing through separate allocations:
+    Agent P Strikes Back spent ~70 % of its frames there (31 % in `enter_frame` alone)
+    for ~3 % of ActionScript,
+    and ruffle#23315, #22192 and #23876 show the same profile on desktop.
+    
+    "frameskip.off" marker: off.
+*/
+static FULL_FRAME_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static ENTER_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_full_frame_skip(enabled: bool) {
+    FULL_FRAME_SKIP.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn full_frame_skip() -> bool {
+    FULL_FRAME_SKIP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Quiet subtrees passed over by "enter_frame" since the last call.
+pub fn take_enter_skipped() -> u64 {
+    ENTER_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/*
+    "obj" has work for the next "enter_frame" (it started playing, or must skip a frame):
+    clear "ENTER_QUIET" on it and up to the top of its tree.
+*/
+pub fn mark_enter_needed<'gc>(obj: DisplayObject<'gc>) {
+    let mut node = Some(obj);
+    while let Some(o) = node {
+        o.base().set_enter_quiet(false);
+        node = o.parent();
+    }
+}
+
+// Whether an "enter_frame" walk may pass over "child" (and count it).
+#[inline]
+pub fn skip_quiet_child(child: DisplayObject<'_>) -> bool {
+    if child.base().enter_quiet() && full_frame_skip() {
+        ENTER_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/*
+    After "child.enter_frame", whether its subtree is quiet.
+    A movie clip decided for itself:
+    the types with an "enter_frame" of their own are never quiet: the others have nothing to do in it and become quiet now.
+*/
+pub fn quiet_after_enter(child: DisplayObject<'_>) -> bool {
+    match child {
+        DisplayObject::MovieClip(_) => child.base().enter_quiet(),
+        DisplayObject::Stage(_) | DisplayObject::Avm2Button(_) | DisplayObject::LoaderDisplay(_) => {
+            false
+        }
+        _ => {
+            child.base().set_enter_quiet(true);
+            true
+        }
+    }
+}
+
+/*
+    End of "run_frame_scripts" on an object whose flag was cleared at its start.
+    
+    It stays dirty if work remains in it (`unfinished`: not yet constructed, a frame script still to run) or in a child:
+    a mark made while its scripts ran has already set it again.
+    Bottom-up, so a dirty object
+    always has dirty ancestors and no walk can pass over it.
+*/
+#[inline]
+pub fn settle_lifecycle_dirty(obj: DisplayObject<'_>, unfinished: bool, child_dirty: bool) {
+    if unfinished || child_dirty {
+        obj.base().set_lifecycle_dirty(true);
+        // The top of an orphan tree that stays dirty must be found again by the next inner goto.
+        if obj.parent().is_none() && obj.as_stage().is_none() {
+            queue_dirty_orphan(obj);
+        }
+    }
+}
+
+/*
+    Bumped every time a tree that is not the stage's gets marked (see "mark_lifecycle_dirty").
+    When it has not moved since the last pass that left every orphan clean,
+    an inner goto has no orphan to visit and skips iterating the list at all.
+*/
+static ORPHAN_MARK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn bump_orphan_mark_epoch() {
+    ORPHAN_MARK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn orphan_mark_epoch() -> u64 {
+    ORPHAN_MARK_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/*
+    Masks behave as in Flash Player for content that puts buttons and filters inside a clip layer
+    (Stick War's mission screen, FlashNX #80, ruffle#5126 and ruffle#12115)
+    
+    See "render_base" and "MovieClip::mouse_pick_avm1". On unless FlashNX finds "maskfix.off".
+*/
+static FLASHNX_MASK_FIXES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_flashnx_mask_fixes(on: bool) {
+    FLASHNX_MASK_FIXES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn flashnx_mask_fixes() -> bool {
+    FLASHNX_MASK_FIXES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -953,7 +1224,20 @@ pub fn render_base<'gc>(
         None
     };
 
-    let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+    /*
+        An object drawn AS A MASK leaves the bitmap cache,
+        and so its filters, out.
+        
+        Flash Player uses a mask's filters (and color transform)
+        only when the maskee is cached as a bitmap too (kjarosh, ruffle#15103):
+        otherwise the mask is its vector shapes.
+        Ruffle has no bitmap masks at all, 
+        so a cached mask became the stencil of its whole rectangle:
+        Stick War's mission screen is the mask of the art behind it,
+        and the drop shadow on its START button (button-record filters, applied since ruffle#11891) turned the button into a black box (ruffle#12115).
+    */
+    let cached = context.use_bitmap_cache && this.is_bitmap_cached() && !(flashnx_mask_fixes() && context.commands.drawing_mask());
+    let cache_info = if cached {
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
@@ -1873,6 +2157,10 @@ pub trait TDisplayObject<'gc>:
         let write = Gc::write(context.gc(), self.base());
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
+        // A new child (and its whole subtree) may need constructing. Marking the child marks the parent's chain too.
+        if parent.is_some() {
+            mark_lifecycle_dirty(self.into());
+        }
 
         if parent_removed {
             if let Some(int) = self.as_interactive() {
@@ -2393,11 +2681,19 @@ pub trait TDisplayObject<'gc>:
 
     /// Run any frame scripts (if they exist and this object needs to run them).
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        // lifecycle flags (see "settle_lifecycle_dirty").
+        self.base().set_lifecycle_dirty(false);
+        let mut child_dirty = false;
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
+                if skip_clean_child(child) {
+                    continue;
+                }
                 child.run_frame_scripts(context);
+                child_dirty |= child.base().lifecycle_dirty();
             }
         }
+        settle_lifecycle_dirty(self.into(), self.object2().is_none(), child_dirty);
     }
 
     /// Called before the child is about to be rendered.
@@ -2585,6 +2881,18 @@ pub trait TDisplayObject<'gc>:
     /// Tests if a given stage position point intersects with the world bounds of this object.
     #[no_dynamic]
     fn hit_test_bounds(self, point: Point<Twips>) -> bool {
+        // Parity with Adobe Flash Player: a display object whose composed
+        // world transform has zero determinant (zero-scale on any axis, or
+        // degenerate skew) is not hit-testable. Without this guard, a zero-
+        // scale placeholder whose translation happens to coincide with the
+        // hit point reports a positive hit, which Mario 63 relies on NOT
+        // happening in the castle scene (#6906 — Toad NPC + ground collision
+        // checks against an offscreen placeholder MC). See the discussion at
+        // https://github.com/ruffle-rs/ruffle/issues/6906 for context.
+        if self.local_to_global_matrix().determinant().abs() <= f32::EPSILON {
+            note_hit_guard(&self.path());
+            return false;
+        }
         self.world_bounds(BoundsMode::Engine).contains(point)
     }
 
@@ -2604,9 +2912,17 @@ pub trait TDisplayObject<'gc>:
         point: Point<Twips>,
         options: HitTestOptions,
     ) -> bool {
+        /*
+            Same zero-scale guard as hit_test_bounds (see #6906).
+            Applied here too because some hit_test_shape overrides (movie_clip, button)
+            bypass hit_test_bounds and walk into per-shape tracing directly.
+        */
+        if self.local_to_global_matrix().determinant().abs() <= f32::EPSILON {
+            note_hit_guard(&self.path());
+            return false;
+        }
         // Default to using bounding box.
-        (!options.contains(HitTestOptions::SKIP_INVISIBLE) || self.visible())
-            && self.hit_test_bounds(point)
+        (!options.contains(HitTestOptions::SKIP_INVISIBLE) || self.visible()) && self.hit_test_bounds(point)
     }
 
     fn post_instantiation(
@@ -2995,6 +3311,26 @@ bitflags! {
         /// (they need to be instantiated "manually" by
         /// `Sprite.constructChildren`).
         const MANUAL_FRAME_CONSTRUCT  = 1 << 16;
+
+        /*
+            Set on the TOP of a display tree (an orphan, or the stage)
+            when something in that tree may give an inner goto work to do:
+            a frame changed, a child was added, a frame script or a goto was queued.
+            
+            See "mark_lifecycle_dirty" and "run_inner_goto_frame".
+        */
+        const LIFECYCLE_DIRTY = 1 << 17;
+
+        /*
+            Nothing in this subtree has work for the next "enter_frame":
+            no clip playing, no frame-skip flag, no queued timeline tag,
+            nothing marked since it was last visited.
+            
+            Set from the bottom up by the visit ("quiet_after_enter"),
+            cleared up to the top of the tree by "mark_lifecycle_dirty" and "mark_enter_needed".
+            A walk passes over such a subtree ("skip_quiet_child").
+        */
+        const ENTER_QUIET = 1 << 18;
     }
 }
 
@@ -3232,3 +3568,27 @@ impl<'gc> DisplayObjectWeak<'gc> {
         }
     }
 }
+
+/*
+    Say out loud, a bounded number of times
+    that the zero-determinant guard (see "hit_test_bounds") refused a hit test, and on what.
+
+    The guard exists for Mario 63 and it is a local patch,
+    which makes it a standing suspect whenever a game's collisions misbehave here but not on upstream Ruffle.
+    
+    A platformer whose ground stops answering is exactly the shape that suspicion takes,
+    so the guard names its victims instead of refusing in silence.
+
+    Capped,
+    because this sits in the hit-test path a game walks thousands of times a second:
+    the first few dozen say everything, and the rest would only cost frames.
+*/
+fn note_hit_guard(path: &WString) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n < 40 {
+        tracing::warn!("hit test REFUSED (zero determinant) on {}", path);
+    }
+}
+

@@ -107,6 +107,9 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
             // See MovieClip::enter_frame for an explanation of this.
             if skip_frame {
                 child.base().set_skip_next_enter_frame(true);
+            } else if crate::display_object::skip_quiet_child(child) {
+                // A quiet subtree has nothing to do ("ENTER_QUIET").
+                continue;
             }
             child.enter_frame(context);
         }
@@ -115,6 +118,10 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         for child in self.iter_render_list() {
+            // An inner goto passes over unchanged subtrees.
+            if crate::display_object::skip_clean_child(child) {
+                continue;
+            }
             child.construct_frame(context);
         }
     }

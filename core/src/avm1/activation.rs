@@ -29,6 +29,131 @@ use web_time::Instant;
 
 use super::object_reference::MovieClipReference;
 
+/*
+	What decoding the bytecode costs, measured inside the interpreter.
+	AVM1 re-decodes every action each time it runs (upstream still does on master):
+	A cache of decoded actions is what upstream #3432 has been asking for since 2021, and these say how much it could save before anyone writes one.
+	Only with the "flashnx_instr" feature though.
+*/
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_AVM1_ACTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_AVM1_DECODE_TICKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_AVM1_TOTAL_TICKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// run_actions nests (function calls): the outermost one feeds the total.
+#[cfg(feature = "flashnx_instr")]
+static FLASHNX_AVM1_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/*
+	Exclusive time and count per action code (the first byte of the action).
+	"Exclusive" because a nested "run_actions" (the body of a function the action called) is subtracted from the action that called it.
+*/
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_OP_TICKS: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) static FLASHNX_OP_COUNT: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+// Time spent in "run_actions" nested under an action running at depth "d", indexed by "d".
+#[cfg(feature = "flashnx_instr")]
+const FLASHNX_MAX_DEPTH: usize = 64;
+#[cfg(feature = "flashnx_instr")]
+static FLASHNX_CHILD_TICKS: [std::sync::atomic::AtomicU64; FLASHNX_MAX_DEPTH] = [const { std::sync::atomic::AtomicU64::new(0) }; FLASHNX_MAX_DEPTH];
+
+/*
+	Per name, exclusive like the per-action table:
+	CallMethod by method name, GetMember by property name. ( [calls, ticks, calls on a display object] )
+	Says which methods a game's ~9 us CallMethods are (issue #109, Madness).
+	Off unless FlashNX's "avm1names.on" marker: the lookup adds ~300 ns to every GetMember, which would skew the measuring build's other figures.
+*/
+#[cfg(feature = "flashnx_instr")]
+static FLASHNX_NAMED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "flashnx_instr")]
+pub(crate) fn flashnx_set_avm1_named(on: bool) { FLASHNX_NAMED_ON.store(on, std::sync::atomic::Ordering::Relaxed); }
+
+// per thread (WString is not Send), the player ticks and reports on one.
+#[cfg(feature = "flashnx_instr")]
+pub(crate) type FlashnxNamed = std::thread::LocalKey<std::cell::RefCell<std::collections::HashMap<WString, [u64; 3]>>>;
+#[cfg(feature = "flashnx_instr")]
+thread_local! {
+    pub(crate) static FLASHNX_CALL_NAMES: std::cell::RefCell<std::collections::HashMap<WString, [u64; 3]>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    pub(crate) static FLASHNX_GET_NAMES: std::cell::RefCell<std::collections::HashMap<WString, [u64; 3]>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(feature = "flashnx_instr")]
+struct FlashnxSpan {
+    depth: usize,
+    nested0: u64,
+    t0: u64,
+}
+
+#[cfg(feature = "flashnx_instr")]
+impl FlashnxSpan {
+    #[inline(always)]
+    fn start() -> Option<Self> {
+        if !FLASHNX_NAMED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let depth = (FLASHNX_AVM1_DEPTH.load(std::sync::atomic::Ordering::Relaxed) as usize)
+            .min(FLASHNX_MAX_DEPTH - 1);
+        Some(Self {
+            depth,
+            nested0: FLASHNX_CHILD_TICKS[depth].load(std::sync::atomic::Ordering::Relaxed),
+            t0: flashnx_ticks(),
+        })
+    }
+
+    fn finish(self, table: &'static FlashnxNamed, name: &WStr, on_clip: bool) {
+        let spent = flashnx_ticks().wrapping_sub(self.t0);
+        let nested = FLASHNX_CHILD_TICKS[self.depth].load(std::sync::atomic::Ordering::Relaxed).wrapping_sub(self.nested0);
+        let ticks = spent.saturating_sub(nested);
+        table.with(|map| {
+            let mut map = map.borrow_mut();
+            if let Some(e) = map.get_mut(name) {
+                e[0] += 1;
+                e[1] += ticks;
+                e[2] += on_clip as u64;
+                return;
+            }
+            map.insert(WString::from(name), [1, ticks, on_clip as u64]);
+        });
+    }
+}
+
+/*
+	Decode "ActionPush" without its "Vec" (Reader::flashnx_read_push).
+	On by default, "avm1push.off" or the profiling build's A/B turn it off.
+*/
+static FLASHNX_FAST_PUSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_avm1_fast_push(on: bool) {
+    FLASHNX_FAST_PUSH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/*
+	The ARM generic timer, read inline:
+	An FFI call per action would cost more than the decode being measured. No nomem/pure, so 2 reads around a call cannot be merged into one.
+*/
+#[cfg(feature = "flashnx_instr")]
+#[inline(always)]
+pub(crate) fn flashnx_ticks() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        unsafe { std::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nostack)) };
+        v
+    }
+    #[cfg(not(target_arch = "aarch64"))] { 0 }
+}
+
 macro_rules! avm_debug {
     ($avm: expr, $($arg:tt)*) => (
         if $avm.show_debug_output() {
@@ -408,16 +533,35 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     pub fn run_actions(&mut self, code: SwfSlice) -> Result<ReturnType<'gc>, Error<'gc>> {
+        #[cfg(feature = "flashnx_instr")]
+        let depth = FLASHNX_AVM1_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        #[cfg(feature = "flashnx_instr")]
+        let t0 = flashnx_ticks();
+
         let mut read = Reader::new(&code.movie.data()[code.start..], self.swf_version());
 
-        loop {
+        let result = loop {
             let result = self.do_action(&code, &mut read);
             match result {
                 Ok(FrameControl::Return(return_type)) => break Ok(return_type),
                 Ok(FrameControl::Continue) => {}
                 Err(e) => break Err(e),
             }
+        };
+
+        #[cfg(feature = "flashnx_instr")]
+        {
+            FLASHNX_AVM1_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let spent = flashnx_ticks().wrapping_sub(t0);
+            if depth == 1 {
+                FLASHNX_AVM1_TOTAL_TICKS.fetch_add(spent, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let parent = (depth as usize - 1).min(FLASHNX_MAX_DEPTH - 1);
+                FLASHNX_CHILD_TICKS[parent].fetch_add(spent, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        result
     }
 
     /// Run a single action from a given action reader.
@@ -429,23 +573,77 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 2000 {
             *self.context.actions_since_timeout_check = 0;
-            if self.context.update_start.elapsed() >= self.context.max_execution_duration {
+            if self.context.update_start.elapsed() >= *self.context.max_execution_duration {
                 return Err(Error::ExecutionTimeout);
             }
+            
+			// The frontend's pause, opened from here while the frame computes (flashnx_script_hook), the time it was up is not the script's
+            let elapsed = self.context.update_start.elapsed();
+            let (stop, held) = crate::player::flashnx_script_hook(elapsed, &mut *self.context.renderer);
+            if stop {
+                return Err(Error::ExecutionTimeout);
+            }
+            self.context.update_start += held;
         }
 
         if reader.get_ref().as_ptr() as usize >= data.as_ref().as_ptr_range().end as usize {
             //Executing beyond the end of a function constitutes an implicit return.
             Ok(FrameControl::Return(ReturnType::Implicit))
         } else {
+            #[cfg(feature = "flashnx_instr")]
+            let op = reader.get_ref().first().copied().unwrap_or(0) as usize;
+
+            #[cfg(feature = "flashnx_instr")]
+            let depth = (FLASHNX_AVM1_DEPTH.load(std::sync::atomic::Ordering::Relaxed) as usize).min(FLASHNX_MAX_DEPTH - 1);
+
+            #[cfg(feature = "flashnx_instr")]
+            let nested0 = FLASHNX_CHILD_TICKS[depth].load(std::sync::atomic::Ordering::Relaxed);
+
+            #[cfg(feature = "flashnx_instr")]
+            let d0 = flashnx_ticks();
+
+            if FLASHNX_FAST_PUSH.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut buf =
+                    [const { std::mem::MaybeUninit::<swf::avm1::types::Value<'_>>::uninit() }; 16];
+                if let Some(read) = reader.flashnx_read_push(&mut buf) {
+                    let n = read?;
+
+                    #[cfg(feature = "flashnx_instr")]
+                    {
+                        FLASHNX_AVM1_DECODE_TICKS.fetch_add( flashnx_ticks().wrapping_sub(d0), std::sync::atomic::Ordering::Relaxed, );
+                        FLASHNX_AVM1_ACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    for value in &buf[..n] {
+                        // SAFETY!1 : "flashnx_read_push" wrote the first "n".
+                        self.flashnx_push_swf_value(unsafe { value.assume_init() });
+                    }
+                    #[cfg(feature = "flashnx_instr")]
+                    {
+                        let spent = flashnx_ticks().wrapping_sub(d0);
+                        let nested = FLASHNX_CHILD_TICKS[depth]
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .wrapping_sub(nested0);
+                        FLASHNX_OP_TICKS[op]
+                            .fetch_add(spent.saturating_sub(nested), std::sync::atomic::Ordering::Relaxed);
+                        FLASHNX_OP_COUNT[op].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(FrameControl::Continue);
+                }
+            }
+			
             let action = reader.read_action()?;
+            #[cfg(feature = "flashnx_instr")]
+            {
+                FLASHNX_AVM1_DECODE_TICKS.fetch_add( flashnx_ticks().wrapping_sub(d0), td::sync::atomic::Ordering::Relaxed, );
+                FLASHNX_AVM1_ACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             avm_debug!(
                 self.context.avm1,
                 "({}) Action: {action:?}",
                 self.id.depth(),
             );
 
-            match action {
+            let result = match action {
                 Action::Add => self.action_add(),
                 Action::Add2 => self.action_add_2(),
                 Action::And => self.action_and(),
@@ -547,7 +745,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Action::WaitForFrame2(action) => self.action_wait_for_frame_2(action, reader),
                 Action::With(action) => self.action_with(action, data),
                 Action::Unknown(action) => self.action_unknown(action),
+            };
+            #[cfg(feature = "flashnx_instr")]
+            {
+                let spent = flashnx_ticks().wrapping_sub(d0);
+                let nested = FLASHNX_CHILD_TICKS[depth].load(std::sync::atomic::Ordering::Relaxed).wrapping_sub(nested0);
+                FLASHNX_OP_TICKS[op].fetch_add(spent.saturating_sub(nested), std::sync::atomic::Ordering::Relaxed);
+                FLASHNX_OP_COUNT[op].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            result
         }
     }
 
@@ -778,6 +984,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     fn action_call_method(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        #[cfg(feature = "flashnx_instr")]
+        let span = FlashnxSpan::start();
         let method_name = self.context.avm1.pop();
         let object_val = self.context.avm1.pop();
         let num_args = self.context.avm1.pop().coerce_to_u32(self)? as usize;
@@ -804,6 +1012,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             // Call `this[method_name]`.
             object.call_method(method_name, &args, self, ExecutionReason::FunctionCall)?
         };
+        #[cfg(feature = "flashnx_instr")]
+        if let Some(span) = span {
+            span.finish(&FLASHNX_CALL_NAMES, &method_name, object.as_display_object().is_some());
+        }
         self.stack_push(result);
 
         self.continue_if_base_clip_exists()
@@ -1065,12 +1277,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     fn action_get_member(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        #[cfg(feature = "flashnx_instr")]
+        let span = FlashnxSpan::start();
         let name_val = self.context.avm1.pop();
         let name = name_val.coerce_to_string(self)?;
         let object_val = self.context.avm1.pop();
         let object = object_val.coerce_to_object_or_bare(self)?;
 
         let result = object.get(name, self)?;
+        #[cfg(feature = "flashnx_instr")]
+        if let Some(span) = span {
+            span.finish(&FLASHNX_GET_NAMES, &name, object.as_display_object().is_some());
+        }
         self.stack_push(result);
 
         Ok(FrameControl::Continue)
@@ -1742,6 +1960,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn action_push(&mut self, action: Push) -> Result<FrameControl<'gc>, Error<'gc>> {
         for value in action.values {
+            self.flashnx_push_swf_value(value);
+        }
+        Ok(FrameControl::Continue)
+    }
+
+    // One value of an "ActionPush" onto the stack (shared by "action_push" and the Vec-free path in "do_action").
+    #[inline]
+    fn flashnx_push_swf_value(&mut self, value: swf::avm1::types::Value<'_>) {
+        {
             use swf::avm1::types::Value as SwfValue;
             let value = match value {
                 SwfValue::Undefined => Value::Undefined,
@@ -1768,7 +1995,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             };
             self.stack_push(value); // Needs to handle MovieClipReferences, in case pushing a register
         }
-        Ok(FrameControl::Continue)
     }
 
     fn action_push_duplicate(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
@@ -1907,37 +2133,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(FrameControl::Continue);
         }
 
+        /*
+			Backport of ruffle 9f4bd1014 ("Fix SetTarget2 movie clip selection"):
+			SetTarget2 goes by the clip's path, not the object, so 2 clips sharing a name target the same one, as in Flash (gnash test opcode_guard_test2).
+		*/
         match target {
-            Value::String(target) => {
-                return self.set_target(&target);
-            }
             Value::Undefined => {
                 // In SWF6 and below, SetTarget2 on an undefined object resets the target to the base clip
                 if self.swf_version() > 6 {
                     self.set_target_clip(None);
                 } else {
                     self.set_target_clip(Some(base_clip));
-                }
-            }
-            Value::Object(o) => {
-                if let Some(clip) = o.as_display_object() {
-                    // MovieClips can be targeted directly.
-                    self.set_target_clip(Some(clip));
-                } else {
-                    // Other objects get coerced to string.
-                    let target = target.coerce_to_string(self)?;
-                    return self.set_target(&target);
-                }
-            }
-            Value::MovieClip(_) => {
-                let o = target.coerce_to_object_or_bare(self)?;
-                if let Some(clip) = o.as_display_object() {
-                    // MovieClips can be targeted directly.
-                    self.set_target_clip(Some(clip));
-                } else {
-                    // Other objects get coerced to string.
-                    let target = target.coerce_to_string(self)?;
-                    return self.set_target(&target);
                 }
             }
             _ => {
@@ -2488,6 +2694,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(Some(o));
         }
 
+        /*
+			A reference to a clip that no longer exists names no clip.
+			Its string form is "", and with "allow_empty" an empty path is the start clip, which right after "removeMovieClip(this)" is "_root":
+			
+			Electricman 2 ends every fight with "removeMovieClip(this); unloadMovie(this);" and so unloaded the whole movie (black screen, ruffle#23193, still open upstream).
+			Before ruffle#22221 such a reference reached the callers as a bare object, which named nothing either.
+		*/
+        if let Value::MovieClip(mcr) = target && mcr.coerce_to_object(self).is_none()
+        {
+            return Ok(None);
+        }
+
         // Otherwise, we coerce it into a string and try to resolve it as a path.
         // This means that values like `undefined` will resolve to clips with an instance name of
         // `"undefined"`, for example.
@@ -2715,9 +2933,30 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             }
         }
 
-        // Finally! It's a plain old variable name.
-        // Resolve using scope chain, as normal.
-        self.resolve(path)
+
+		/*
+			Backport of upstream PR #18885, which fixes ruffle#10582 (Super Mario 63's final battle never appears, issue #114).
+
+			The fight's setup calls "CharCode()" from a clip that "_root .gotoAndStop("Courseframe")" has just destroyed.
+			With the clip gone its scope chain no longer resolves the name, so the call returns
+			Undefined, the terrain is never attached, and the log fills with "Tried to instantiate non-registered character 8-16MidBG".
+			Flash Player falls back to the root, Ruffle doesn't.
+		*/
+        match self.resolve(path)? {
+            CallableValue::UnCallable(Value::Undefined) => {
+                /*
+					The PR reads ".object().coerce_to_object(self)", this tree has since replaced that pair with "object1_or_bare",
+					which is what the 2 other call sites in this file use (lines 1804-3052).
+				*/
+                let obj = self.target_clip_or_root().object1_or_bare(self.gc());
+                if obj.has_property(self, path) {
+                    obj.get(path, self).map(|v| CallableValue::Callable(obj, v))
+                } else {
+                    Ok(CallableValue::UnCallable(Value::Undefined))
+                }
+            }
+            val => Ok(val),
+        }
     }
 
     /// Sets the value referenced by a target path string.
